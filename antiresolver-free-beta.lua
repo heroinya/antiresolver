@@ -35,8 +35,10 @@ local function defaults()
         resolver = {enabled = true, mode = "Auto", pitch = "Auto", bodyAfter = 3, cycleAfter = 1,
             safe = false, memory = 12, dtWindowMs = 150, debug = false},
         builder = {enabled = false, slow = 6, hysteresis = 3, manualKey = "V", profiles = profiles},
+        sync = {enabled = true, endpoint = "", logoAsset = "", tabBadges = true, espBadges = true, stealth = false},
     }
 end
+local Sync = {}
 local function member(value, choices)
     for _, allowed in ipairs(choices) do if value == allowed then return true end end
     return false
@@ -65,6 +67,15 @@ local function validate(inputSettings)
     local source = object(inputSettings)
     local result = defaults()
     local r, b = object(source.resolver), object(source.builder)
+    local s = object(source.sync)
+    result.sync = {
+        enabled = boolean(s.enabled, true),
+        endpoint = type(s.endpoint) == "string" and (s.endpoint:match("^%s*(.-)%s*$") or ""):sub(1, 200) or "",
+        logoAsset = type(s.logoAsset) == "string" and (s.logoAsset:match("^%s*(.-)%s*$") or ""):sub(1, 120) or "",
+        tabBadges = boolean(s.tabBadges, true),
+        espBadges = boolean(s.espBadges, true),
+        stealth = boolean(s.stealth, false),
+    }
     result.resolver = {
         enabled = boolean(r.enabled, true), mode = choice(resolverMode(r.mode), "Auto", MODES),
         pitch = choice(r.pitch, "Auto", {"Auto", "Raw", "Off"}),
@@ -1575,6 +1586,1020 @@ applySettings = function(value)
     Settings, Options = nextSettings, nextSettings.resolver
     Resolver.fault, Builder.fault = nil, nil
     activeMode = nil
+    if Sync and Sync.onSettingsApplied then Sync.onSettingsApplied() end
+end
+
+do
+    -- Fill DEFAULT_SYNC_URL and DEFAULT_LOGO_ASSET before publishing to GitHub.
+    local S = {
+        DEFAULT_SYNC_URL = "https://brilliant-semolina-d874d6.netlify.app/api/presence",
+        DEFAULT_LOGO_ASSET = "",
+        DEFAULT_CLIENT_KEY = "",
+        POLL_INTERVAL = 15,
+        MIN_POLL_GAP = 8.5,
+        SCAN_INTERVAL = 0.9,
+        EMPTY_SCAN_INTERVAL = 2.4,
+        MAX_SCAN_NODES = 1600,
+        ROLE_ORDER = {dev = 5, staff = 4, vip = 3, beta = 2, free = 1},
+        ROLE_TAGS = {dev = "DEV", staff = "MOD", vip = "VIP", beta = "BETA", free = "AR"},
+        SKIP_GUI_HINTS = {"arbadge", "ar_esp", "bubblechat", "experiencechat", "killfeed", "freecam"},
+        IGNORE_TEXT_ANCESTOR = {"chat", "kill", "feed", "death", "spectat", "bubble", "log", "menu"},
+        SCOREBOARD_HINTS = {"tab", "score", "board", "player", "roster", "list", "leader"},
+        nativeViews = {},
+        gen = 0,
+        inFlight = false,
+        scanRunning = false,
+        nextPollAt = 0,
+        lastAttemptAt = 0,
+        nextScanAt = 0,
+        failCount = 0,
+        lastOkAt = nil,
+        storageMode = nil,
+        selfRole = "idle",
+        statusNote = "Idle",
+        peerBadges = {},
+        badgeCount = 0,
+        tabCount = 0,
+        tabBadges = {},
+        espDrawings = {},
+        espBillboards = {},
+        billboardBroken = false,
+        cachedScoreboardRoot = nil,
+        cachedHttpFn = false,
+        cachedPlayersSvc = false,
+        lastVisibleLang = nil,
+        lastVisiblePage = nil,
+    }
+    local H = {}
+
+    function H.nowSafe()
+        local ok, t = pcall(now)
+        if ok and finite(t) then return t end
+        return os.clock and os.clock() or 0
+    end
+
+    function H.roleColor(role)
+        if not S.roleColors then
+            S.roleColors = {
+                dev = Color3.fromRGB(255, 204, 72),
+                staff = Color3.fromRGB(115, 230, 175),
+                vip = Color3.fromRGB(205, 130, 255),
+                beta = Color3.fromRGB(120, 200, 255),
+                free = Color3.fromRGB(130, 165, 255),
+            }
+        end
+        return S.roleColors[role] or S.roleColors.free
+    end
+
+    function H.syncCfg()
+        if not Settings.sync then
+            Settings.sync = {enabled = true, endpoint = "", logoAsset = "", tabBadges = true, espBadges = true, stealth = false}
+        end
+        return Settings.sync
+    end
+
+    function H.trimStr(val)
+        if type(val) ~= "string" then return "" end
+        return val:match("^%s*(.-)%s*$") or ""
+    end
+
+    function H.effectiveUrl()
+        local cfg = H.syncCfg()
+        local raw = H.trimStr(cfg.endpoint)
+        if raw == "" then raw = H.trimStr(S.DEFAULT_SYNC_URL) end
+        if raw == "" then return "" end
+        raw = raw:gsub("/+$", "")
+        if not raw:match("^https?://[%w%.%-_:%/]+$") then return "" end
+        if not raw:match("^https?://[^/]+/.+$") then raw = raw .. "/api/presence" end
+        return raw
+    end
+
+    function H.effectiveAsset()
+        local cfg = H.syncCfg()
+        local raw = H.trimStr(cfg.logoAsset)
+        if raw == "" then raw = H.trimStr(S.DEFAULT_LOGO_ASSET) end
+        if raw == "" then return "" end
+        if raw:match("^%d+$") then return "rbxassetid://" .. raw end
+        if raw:match("^rbxassetid://%d+$") or raw:match("^rbxthumb://") then return raw end
+        local urlId = raw:match("asset/(%d+)") or raw:match("library/(%d+)") or raw:match("catalog/(%d+)") or raw:match("id=(%d+)")
+        if urlId then return "rbxthumb://type=Asset&id=" .. urlId .. "&w=150&h=150" end
+        return ""
+    end
+
+    function H.getPlayersService()
+        if S.cachedPlayersSvc ~= false then return S.cachedPlayersSvc end
+        local ok, svc = pcall(function() return game:GetService("Players") end)
+        S.cachedPlayersSvc = (ok and svc) or nil
+        return S.cachedPlayersSvc
+    end
+
+    function H.getPlayerGui()
+        local svc = H.getPlayersService()
+        local lp = nil
+        if svc then
+            local ok, p = pcall(function() return svc.LocalPlayer end)
+            if ok and p then lp = p end
+        end
+        if not lp and type(entity.get_local_player) == "function" then
+            local ok, p = pcall(entity.get_local_player)
+            if ok and p then lp = p end
+        end
+        if not lp then return nil, lp end
+        local ok, pg = pcall(function()
+            return lp:FindFirstChildOfClass("PlayerGui") or lp:FindFirstChild("PlayerGui")
+        end)
+        return (ok and pg) or nil, lp
+    end
+
+    function H.resolveHttpRequest()
+        if S.cachedHttpFn ~= false then return S.cachedHttpFn end
+        local getters = {
+            function() return request end,
+            function() return http_request end,
+            function() return http and http.request end,
+            function() return client and client.request end,
+            function() return syn and syn.request end,
+        }
+        for _, getter in ipairs(getters) do
+            local ok, fn = pcall(getter)
+            if ok and type(fn) == "function" then
+                S.cachedHttpFn = fn
+                return fn
+            end
+        end
+        S.cachedHttpFn = nil
+        return nil
+    end
+
+    function H.readSafeId(player)
+        local ok, id = pcall(readUserId, player)
+        if ok and finite(id) and id > 0 and id % 1 == 0 then return id end
+        return nil
+    end
+
+    function H.readNames(player)
+        local n, d = nil, nil
+        local ok1, v1 = pcall(function() return player.Name end)
+        if ok1 and type(v1) == "string" and #v1 > 0 then n = v1 end
+        local ok2, v2 = pcall(function() return player.DisplayName end)
+        if ok2 and type(v2) == "string" and #v2 > 0 then d = v2 end
+        return n, d
+    end
+
+    function H.collectPlayers()
+        local _, lp = H.getPlayerGui()
+        local myId = lp and H.readSafeId(lp) or nil
+        local byId, peerIds, meta = {}, {}, {}
+        local svc = H.getPlayersService()
+        local list = nil
+        if svc then
+            local ok, res = pcall(function() return svc:GetPlayers() end)
+            if ok and type(res) == "table" then list = res end
+        end
+        if not list and type(entity.get_players) == "function" then
+            local ok, res = pcall(entity.get_players, false)
+            if ok and type(res) == "table" then list = res end
+        end
+        if list then
+            for _, p in ipairs(list) do
+                local id = H.readSafeId(p)
+                if id then
+                    byId[id] = p
+                    local n, d = H.readNames(p)
+                    meta[id] = {name = n, display = d}
+                    if id ~= myId and #peerIds < 64 then
+                        peerIds[#peerIds + 1] = id
+                    end
+                end
+            end
+        end
+        return myId, peerIds, byId, meta
+    end
+
+    function H.recountTab()
+        local n = 0
+        for _ in pairs(S.tabBadges) do n = n + 1 end
+        S.tabCount = n
+    end
+
+    function H.removeTabEntry(id)
+        local entry = S.tabBadges[id]
+        if not entry then return end
+        S.tabBadges[id] = nil
+        if entry.gui then pcall(function() entry.gui:Destroy() end) end
+        H.recountTab()
+    end
+
+    function H.clearTabBadges()
+        for id in pairs(S.tabBadges) do
+            H.removeTabEntry(id)
+        end
+        S.tabBadges = {}
+        S.tabCount = 0
+    end
+
+    function H.destroyDraw(obj)
+        if not obj then return end
+        pcall(function() obj.Visible = false end)
+        if type(obj.Destroy) == "function" then
+            pcall(obj.Destroy, obj)
+        elseif type(obj.Remove) == "function" then
+            pcall(obj.Remove, obj)
+        end
+    end
+
+    function H.clearEsp()
+        for id, obj in pairs(S.espDrawings) do
+            H.destroyDraw(obj)
+            S.espDrawings[id] = nil
+        end
+        for id, bb in pairs(S.espBillboards) do
+            if bb then pcall(function() bb:Destroy() end) end
+            S.espBillboards[id] = nil
+        end
+    end
+
+    function H.containsHint(text, hints)
+        if type(text) ~= "string" or #text == 0 then return false end
+        local low = string.lower(text)
+        for _, h in ipairs(hints) do
+            if low:find(h, 1, true) then return true end
+        end
+        return false
+    end
+
+    function H.readNameSafe(inst)
+        local ok, n = pcall(function() return inst.Name end)
+        return (ok and type(n) == "string") and n or ""
+    end
+
+    function H.shouldSkipNode(inst)
+        local low = string.lower(H.readNameSafe(inst))
+        if low == "chat" then return true end
+        return H.containsHint(low, S.SKIP_GUI_HINTS)
+    end
+
+    function H.findAncestorScoreboard(node, playerGui)
+        local cur = node
+        local best = nil
+        for _ = 1, 6 do
+            local ok, p = pcall(function() return cur.Parent end)
+            if not ok or not p or p == playerGui then break end
+            if H.containsHint(H.readNameSafe(p), S.SCOREBOARD_HINTS) then best = p end
+            cur = p
+        end
+        return best
+    end
+
+    function H.isLikelyRowTextNode(node, playerGui)
+        local cur = node
+        local hasList = false
+        for step = 1, 4 do
+            local ok, p = pcall(function() return cur.Parent end)
+            if not ok or not p or p == playerGui then break end
+            local pName = H.readNameSafe(p)
+            if H.containsHint(pName, S.IGNORE_TEXT_ANCESTOR) then return false end
+            if H.containsHint(pName, S.SCOREBOARD_HINTS) then hasList = true end
+            if step <= 2 and not hasList then
+                local okC, ch = pcall(function() return p:GetChildren() end)
+                if okC and type(ch) == "table" then
+                    if step == 1 and #ch >= 2 then
+                        for _, sib in ipairs(ch) do
+                            local isImg = pcall(function() return sib:IsA("ImageLabel") or sib:IsA("ImageButton") end) and (sib:IsA("ImageLabel") or sib:IsA("ImageButton"))
+                            local isLayout = pcall(function() return sib:IsA("UIListLayout") or sib:IsA("UIGridLayout") end) and (sib:IsA("UIListLayout") or sib:IsA("UIGridLayout"))
+                            if isImg or isLayout then hasList = true; break end
+                        end
+                    end
+                    local okSf, sf = pcall(function() return p:IsA("ScrollingFrame") end)
+                    if okSf and sf then hasList = true end
+                end
+            end
+            cur = p
+        end
+        return hasList
+    end
+
+    function H.wantedMap(myId)
+        local cfg = H.syncCfg()
+        local wanted = {}
+        local count = 0
+        for id, role in pairs(S.peerBadges) do
+            wanted[id] = role
+            count = count + 1
+        end
+        if not cfg.stealth and myId and S.ROLE_ORDER[S.selfRole] then
+            if not wanted[myId] then count = count + 1 end
+            wanted[myId] = S.selfRole
+        end
+        return wanted, count
+    end
+
+    function H.attachTabBadge(id, host, hostKind, role, asset)
+        local badgeName = "ARBadge_" .. tostring(id)
+        local sig = tostring(role) .. "|" .. tostring(asset) .. "|" .. tostring(hostKind)
+        local existing = S.tabBadges[id]
+        if existing and existing.host == host and existing.sig == sig then
+            local okP, par = pcall(function() return existing.gui and existing.gui.Parent end)
+            if okP and par == host then return true end
+        end
+        if existing then H.removeTabEntry(id) end
+        pcall(function()
+            local old = host:FindFirstChild(badgeName)
+            if old then old:Destroy() end
+        end)
+
+        local okMake, frame = pcall(function()
+            local zBase = 2
+            pcall(function()
+                if finite(host.ZIndex) then zBase = math.min(50, math.max(1, host.ZIndex + 4)) end
+            end)
+            local color = H.roleColor(role)
+            local f = Instance.new("Frame")
+            f.Name = badgeName
+            f.BackgroundColor3 = Color3.fromRGB(13, 15, 20)
+            f.BackgroundTransparency = 0.08
+            f.BorderSizePixel = 0
+            f.ZIndex = zBase
+            if hostKind == "avatar" then
+                f.Size = asset ~= "" and UDim2.new(0, 16, 0, 16) or UDim2.new(0, 18, 0, 14)
+                f.AnchorPoint = Vector2.new(1, 1)
+                f.Position = UDim2.new(1, 0, 1, 0)
+            else
+                f.Size = UDim2.new(0, asset ~= "" and 18 or (role == "free" and 24 or 28), 0, asset ~= "" and 18 or 14)
+                f.AnchorPoint = Vector2.new(1, 0.5)
+                f.Position = UDim2.new(1, -2, 0.5, 0)
+            end
+            pcall(function()
+                local corner = Instance.new("UICorner")
+                corner.CornerRadius = UDim.new(0, 4)
+                corner.Parent = f
+                local stroke = Instance.new("UIStroke")
+                stroke.Thickness = 1
+                stroke.Color = color
+                stroke.Parent = f
+            end)
+            if asset ~= "" then
+                local img = Instance.new("ImageLabel")
+                img.Name = "Icon"
+                img.Size = UDim2.new(1, 0, 1, 0)
+                img.Position = UDim2.new(0, 0, 0, 0)
+                img.BackgroundTransparency = 1
+                img.Image = asset
+                img.ZIndex = zBase + 1
+                pcall(function() img.ScaleType = Enum.ScaleType.Fit end)
+                pcall(function()
+                    local ic = Instance.new("UICorner")
+                    ic.CornerRadius = UDim.new(0, 4)
+                    ic.Parent = img
+                end)
+                img.Parent = f
+            else
+                local lbl = Instance.new("TextLabel")
+                lbl.Name = "Tag"
+                lbl.Size = UDim2.new(1, 0, 1, 0)
+                lbl.BackgroundTransparency = 1
+                lbl.Text = S.ROLE_TAGS[role] or "AR"
+                lbl.TextColor3 = role == "free" and Color3.fromRGB(255, 255, 255) or color
+                lbl.ZIndex = zBase + 1
+                pcall(function() lbl.TextScaled = true end)
+                pcall(function() lbl.Font = Enum.Font.GothamBold end)
+                if role == "free" then
+                    pcall(function()
+                        local grad = Instance.new("UIGradient")
+                        grad.Color = ColorSequence.new(Color3.fromRGB(224, 245, 255), Color3.fromRGB(44, 134, 246))
+                        grad.Rotation = 15
+                        grad.Parent = lbl
+                    end)
+                end
+                lbl.Parent = f
+            end
+            f.Parent = host
+            return f
+        end)
+        if okMake and frame then
+            S.tabBadges[id] = {gui = frame, host = host, sig = sig, kind = hostKind}
+            H.recountTab()
+            return true
+        end
+        return false
+    end
+
+    function H.buildMatchIndexes(wanted, meta)
+        local byAvatarId, byName, duplicateNames = {}, {}, {}
+        for id in pairs(wanted) do
+            byAvatarId[tostring(id)] = id
+            local m = meta[id]
+            if m then
+                for _, keyName in ipairs({m.name, m.display}) do
+                    if type(keyName) == "string" and #keyName > 0 then
+                        local low = string.lower(H.trimStr(keyName))
+                        if not duplicateNames[low] then
+                            if byName[low] and byName[low] ~= id then
+                                byName[low] = nil
+                                duplicateNames[low] = true
+                            else
+                                byName[low] = id
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return byAvatarId, byName
+    end
+
+    function H.scanRootForHosts(root, playerGui, byAvatarId, byName)
+        local avatarHosts, textHosts = {}, {}
+        local queue = {root}
+        local head, visited = 1, 0
+        local foundScoreboard = nil
+        while head <= #queue and visited < S.MAX_SCAN_NODES do
+            local node = queue[head]
+            head = head + 1
+            visited = visited + 1
+            if not H.shouldSkipNode(node) then
+                local okImg, isImg = pcall(function() return node:IsA("ImageLabel") or node:IsA("ImageButton") end)
+                if okImg and isImg then
+                    local okSrc, src = pcall(function() return node.Image end)
+                    if okSrc and type(src) == "string" and #src > 0 then
+                        local low = string.lower(src)
+                        local uidStr = low:match("id=(%d+)") or low:match("userid=(%d+)") or low:match("users/(%d+)")
+                        if uidStr and byAvatarId[uidStr] then
+                            local id = byAvatarId[uidStr]
+                            avatarHosts[id] = node
+                            if not foundScoreboard then
+                                foundScoreboard = H.findAncestorScoreboard(node, playerGui)
+                            end
+                        end
+                    end
+                else
+                    local okTxt, isTxt = pcall(function() return node:IsA("TextLabel") or node:IsA("TextButton") end)
+                    if okTxt and isTxt then
+                        local okVal, txt = pcall(function() return node.Text end)
+                        if okVal and type(txt) == "string" and #txt > 0 and #txt <= 48 then
+                            local clean = string.lower(H.trimStr(txt)):gsub("^@", "")
+                            local id = byName[clean]
+                            if id and not textHosts[id] and H.isLikelyRowTextNode(node, playerGui) then
+                                textHosts[id] = node
+                            end
+                        end
+                    end
+                end
+                local okCh, children = pcall(function() return node:GetChildren() end)
+                if okCh and type(children) == "table" then
+                    for _, ch in ipairs(children) do
+                        queue[#queue + 1] = ch
+                    end
+                end
+            end
+        end
+        return avatarHosts, textHosts, foundScoreboard
+    end
+
+    function H.startTabScan(gen)
+        if S.scanRunning then return end
+        local cfg = H.syncCfg()
+        if not cfg.enabled or not cfg.tabBadges then H.clearTabBadges(); return end
+        local playerGui, _ = H.getPlayerGui()
+        if not playerGui then return end
+        local myId, _, _, meta = H.collectPlayers()
+        local wanted, wantCount = H.wantedMap(myId)
+        for id in pairs(S.tabBadges) do
+            if not wanted[id] then H.removeTabEntry(id) end
+        end
+        if wantCount == 0 then return end
+
+        S.scanRunning = true
+        local asset = H.effectiveAsset()
+        local function work()
+            if gen ~= S.gen or not alive then S.scanRunning = false; return end
+            local byAvatarId, byName = H.buildMatchIndexes(wanted, meta)
+            local roots = {}
+            if S.cachedScoreboardRoot then
+                local okDesc, inside = pcall(function() return S.cachedScoreboardRoot:IsDescendantOf(playerGui) end)
+                if okDesc and inside then
+                    roots[1] = S.cachedScoreboardRoot
+                else
+                    S.cachedScoreboardRoot = nil
+                end
+            end
+            if #roots == 0 then
+                local okCh, topList = pcall(function() return playerGui:GetChildren() end)
+                if okCh and type(topList) == "table" then
+                    local secondary = {}
+                    for _, gui in ipairs(topList) do
+                        if not H.shouldSkipNode(gui) then
+                            if H.containsHint(H.readNameSafe(gui), S.SCOREBOARD_HINTS) then
+                                roots[#roots + 1] = gui
+                            else
+                                secondary[#secondary + 1] = gui
+                            end
+                        end
+                    end
+                    for _, gui in ipairs(secondary) do roots[#roots + 1] = gui end
+                end
+            end
+
+            local mergedAvatar, mergedText = {}, {}
+            for _, root in ipairs(roots) do
+                if gen ~= S.gen or not alive then break end
+                local av, tx, sb = H.scanRootForHosts(root, playerGui, byAvatarId, byName)
+                if sb and not S.cachedScoreboardRoot then S.cachedScoreboardRoot = sb end
+                for k, v in pairs(av) do if not mergedAvatar[k] then mergedAvatar[k] = v end end
+                for k, v in pairs(tx) do if not mergedText[k] then mergedText[k] = v end end
+            end
+
+            if gen == S.gen and alive then
+                local attachedAny = false
+                for id, role in pairs(wanted) do
+                    local host = mergedAvatar[id] or mergedText[id]
+                    local kind = mergedAvatar[id] and "avatar" or "text"
+                    if host then
+                        if H.attachTabBadge(id, host, kind, role, asset) then attachedAny = true end
+                    else
+                        H.removeTabEntry(id)
+                    end
+                end
+                local t = H.nowSafe()
+                S.nextScanAt = t + (attachedAny and S.SCAN_INTERVAL or S.EMPTY_SCAN_INTERVAL)
+            end
+            S.scanRunning = false
+        end
+        if type(task) == "table" and type(task.spawn) == "function" then
+            task.spawn(work)
+        else
+            pcall(work)
+            S.scanRunning = false
+        end
+    end
+
+    function H.startHttpPoll(url, reqFn)
+        if S.inFlight then return end
+        if type(json) ~= "table" or type(json.stringify) ~= "function" or type(json.parse) ~= "function" then
+            S.statusNote = "JSON API missing"
+            S.nextPollAt = H.nowSafe() + 30
+            return
+        end
+        local myId, peerIds = H.collectPlayers()
+        if not myId then
+            S.statusNote = "Waiting for LocalPlayer"
+            S.nextPollAt = H.nowSafe() + 3
+            return
+        end
+
+        local cfg = H.syncCfg()
+        local payload = {user_id = myId, stealth = cfg.stealth == true, peers = peerIds}
+        local okEnc, body = pcall(json.stringify, payload)
+        if not okEnc or type(body) ~= "string" then
+            S.statusNote = "JSON encode failed"
+            S.nextPollAt = H.nowSafe() + 20
+            return
+        end
+
+        local headers = {["Content-Type"] = "application/json"}
+        if S.DEFAULT_CLIENT_KEY ~= "" then headers["X-AR-Client"] = S.DEFAULT_CLIENT_KEY end
+
+        S.inFlight = true
+        S.lastAttemptAt = H.nowSafe()
+        local gen = S.gen
+
+        local function doRequest()
+            local okCall, resp = pcall(reqFn, {Url = url, Method = "POST", Headers = headers, Body = body})
+            if gen ~= S.gen or not alive then S.inFlight = false; return end
+            S.inFlight = false
+            local t = H.nowSafe()
+            if not okCall or type(resp) ~= "table" then
+                S.failCount = S.failCount + 1
+                S.statusNote = "Network error"
+                S.nextPollAt = t + math.min(60, 18 + S.failCount * 10)
+                return
+            end
+
+            local code = tonumber(resp.StatusCode) or 0
+            if code == 429 then
+                local waitSec = 25
+                if type(resp.Body) == "string" and #resp.Body > 0 then
+                    local okJ, d = pcall(json.parse, resp.Body)
+                    if okJ and type(d) == "table" and finite(d.retryAfter) then
+                        waitSec = math.clamp(d.retryAfter + 2, 12, 90)
+                    end
+                end
+                S.failCount = S.failCount + 1
+                S.statusNote = "Rate limited (" .. tostring(waitSec) .. "s)"
+                S.nextPollAt = t + waitSec
+                return
+            elseif code == 403 then
+                S.statusNote = "Client key rejected (403)"
+                S.nextPollAt = t + 45
+                return
+            elseif code < 200 or code >= 300 then
+                S.failCount = S.failCount + 1
+                S.statusNote = "HTTP " .. tostring(code)
+                S.nextPollAt = t + math.min(60, 20 + S.failCount * 10)
+                return
+            end
+
+            local okDec, data = pcall(json.parse, resp.Body or "")
+            if not okDec or type(data) ~= "table" or not data.ok then
+                S.failCount = S.failCount + 1
+                S.statusNote = "Bad JSON response"
+                S.nextPollAt = t + 25
+                return
+            end
+
+            S.failCount = 0
+            S.lastOkAt = t
+            S.storageMode = type(data.storage) == "string" and data.storage or nil
+            S.selfRole = type(data.self) == "string" and data.self or "free"
+            S.statusNote = "Online"
+
+            local nextMap, nextCount = {}, 0
+            if type(data.badges) == "table" then
+                for idKey, roleVal in pairs(data.badges) do
+                    local idNum = tonumber(idKey)
+                    if idNum and S.ROLE_ORDER[roleVal] then
+                        nextMap[idNum] = roleVal
+                        nextCount = nextCount + 1
+                    end
+                end
+            end
+            S.peerBadges = nextMap
+            S.badgeCount = nextCount
+            S.nextPollAt = t + S.POLL_INTERVAL + math.random(0, 3)
+            S.nextScanAt = 0
+        end
+
+        if type(task) == "table" and type(task.spawn) == "function" then
+            task.spawn(doRequest)
+        else
+            pcall(doRequest)
+            S.inFlight = false
+        end
+    end
+
+    function H.playerHeadPartAndPos(player)
+        local headPart = nil
+        local okChar, char = pcall(function() return player.Character end)
+        if okChar and char then
+            local okHp, hp = pcall(function() return char:FindFirstChild("Head") end)
+            if okHp and hp then headPart = hp end
+        end
+        local pos = nil
+        if type(entity.get_player_hitbox_position) == "function" then
+            local okP, v = pcall(entity.get_player_hitbox_position, player, "head")
+            if okP and v then pos = v end
+        end
+        if not pos and headPart then
+            local okV, v = pcall(function() return headPart.Position end)
+            if okV and v then pos = v end
+        end
+        return headPart, pos
+    end
+
+    function H.worldToScreenSafe(pos)
+        if type(render) == "table" and type(render.world_to_screen) == "function" then
+            local ok, x, y, vis = pcall(render.world_to_screen, pos)
+            if ok and finite(x) and finite(y) then return x, y, vis == true end
+        end
+        local okCam, vec, onScreen = pcall(function()
+            local cam = workspace and workspace.CurrentCamera
+            if not cam then return nil, false end
+            local v, vis = cam:WorldToViewportPoint(pos)
+            return v, vis
+        end)
+        if okCam and vec and onScreen and finite(vec.Z) and vec.Z > 0 then
+            return vec.X, vec.Y, true
+        end
+        return nil, nil, false
+    end
+
+    function H.updateEsp()
+        local cfg = H.syncCfg()
+        if not cfg.enabled or not cfg.espBadges then
+            H.clearEsp()
+            return
+        end
+        local myId, _, byId = H.collectPlayers()
+        local asset = H.effectiveAsset()
+        local playerGui = (asset ~= "" and not S.billboardBroken) and (H.getPlayerGui()) or nil
+        local active = {}
+
+        for id, role in pairs(S.peerBadges) do
+            local player = byId[id]
+            if id ~= myId and player then
+                local isAlivePlayer = true
+                if type(entity.is_alive) == "function" then
+                    local okA, resA = pcall(entity.is_alive, player)
+                    if okA and resA == false then isAlivePlayer = false end
+                end
+                if isAlivePlayer then
+                    local headPart, headPos = H.playerHeadPartAndPos(player)
+                    if headPos then
+                        active[id] = true
+                        local usedBillboard = false
+                        if asset ~= "" and not S.billboardBroken and playerGui and headPart then
+                            local bb = S.espBillboards[id]
+                            if bb then
+                                local okAd = pcall(function()
+                                    if bb.Parent ~= playerGui then bb.Parent = playerGui end
+                                    if bb.Adornee ~= headPart then bb.Adornee = headPart end
+                                    local img = bb:FindFirstChild("Icon")
+                                    if img and img.Image ~= asset then img.Image = asset end
+                                end)
+                                usedBillboard = okAd
+                            else
+                                local okNew, newBb = pcall(function()
+                                    local g = Instance.new("BillboardGui")
+                                    g.Name = "AR_Esp_" .. tostring(id)
+                                    g.Size = UDim2.new(0, 22, 0, 22)
+                                    g.StudsOffset = Vector3.new(0, 2.35, 0)
+                                    g.AlwaysOnTop = true
+                                    g.Adornee = headPart
+                                    local img = Instance.new("ImageLabel")
+                                    img.Name = "Icon"
+                                    img.Size = UDim2.new(1, 0, 1, 0)
+                                    img.BackgroundColor3 = Color3.fromRGB(13, 15, 20)
+                                    img.BackgroundTransparency = 0.08
+                                    img.BorderSizePixel = 0
+                                    img.Image = asset
+                                    pcall(function() img.ScaleType = Enum.ScaleType.Fit end)
+                                    pcall(function()
+                                        local ic = Instance.new("UICorner")
+                                        ic.CornerRadius = UDim.new(0, 6)
+                                        ic.Parent = img
+                                        local st = Instance.new("UIStroke")
+                                        st.Thickness = 1
+                                        st.Color = H.roleColor(role)
+                                        st.Parent = img
+                                    end)
+                                    img.Parent = g
+                                    g.Parent = playerGui
+                                    return g
+                                end)
+                                if okNew and newBb then
+                                    S.espBillboards[id] = newBb
+                                    usedBillboard = true
+                                else
+                                    S.billboardBroken = true
+                                end
+                            end
+                        end
+
+                        if usedBillboard then
+                            if S.espDrawings[id] then
+                                pcall(function() S.espDrawings[id].Visible = false end)
+                            end
+                        else
+                            if S.espBillboards[id] then
+                                pcall(function() S.espBillboards[id]:Destroy() end)
+                                S.espBillboards[id] = nil
+                            end
+                            local sx, sy, onScreen = H.worldToScreenSafe(headPos + Vector3.new(0, 1.35, 0))
+                            local lbl = S.espDrawings[id]
+                            if not lbl and type(Drawing) == "table" and type(Drawing.new) == "function" then
+                                local okD, obj = pcall(Drawing.new, "Text")
+                                if okD and obj then
+                                    pcall(function()
+                                        obj.Size = 13
+                                        obj.Center = true
+                                        obj.Outline = true
+                                    end)
+                                    S.espDrawings[id] = obj
+                                    lbl = obj
+                                end
+                            end
+                            if lbl then
+                                pcall(function()
+                                    if onScreen and sx and sy then
+                                        lbl.Text = "[" .. (S.ROLE_TAGS[role] or "AR") .. "]"
+                                        lbl.Color = H.roleColor(role)
+                                        lbl.Position = Vector2.new(sx, sy - 14)
+                                        lbl.Visible = true
+                                    else
+                                        lbl.Visible = false
+                                    end
+                                end)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        for id, obj in pairs(S.espDrawings) do
+            if not active[id] then
+                H.destroyDraw(obj)
+                S.espDrawings[id] = nil
+            end
+        end
+        for id, bb in pairs(S.espBillboards) do
+            if not active[id] then
+                pcall(function() bb:Destroy() end)
+                S.espBillboards[id] = nil
+            end
+        end
+    end
+
+    function Sync.statusText(language)
+        local ru = language == "RU"
+        local cfg = H.syncCfg()
+        if not cfg.enabled then return ru and "Статус: выключен" or "Status: disabled" end
+        if H.effectiveUrl() == "" then return ru and "Статус: вставьте Sync URL" or "Status: set Sync URL" end
+        if not H.resolveHttpRequest() then return ru and "Статус: HTTP API недоступен" or "Status: HTTP API unavailable" end
+        if S.lastOkAt then
+            local roleStr = cfg.stealth and (ru and "скрыт" or "stealth") or string.upper(tostring(S.selfRole or "free"))
+            local memTag = S.storageMode == "memory-fallback" and " · RAM" or ""
+            if ru then
+                return string.format("Статус: онлайн (%s) · пиры: %d · Tab: %d%s", roleStr, S.badgeCount, S.tabCount, memTag)
+            end
+            return string.format("Status: online (%s) · peers: %d · Tab: %d%s", roleStr, S.badgeCount, S.tabCount, memTag)
+        end
+        return (ru and "Статус: " or "Status: ") .. tostring(S.statusNote or "Idle")
+    end
+
+    function Sync.buildNativeSection(language, section, T)
+        local cfg = H.syncCfg()
+        local statusLbl = section:new_label(Sync.statusText(language))
+        local urlBox = section:new_textbox(T("Sync URL"), "Default (leave empty)", cfg.endpoint or "", function(v)
+            local clean = H.trimStr(v):sub(1, 200)
+            H.syncCfg().endpoint = clean
+            Sync.onSettingsApplied()
+        end)
+        local assetBox = section:new_textbox(T("Logo asset ID"), "rbxassetid://123456789", cfg.logoAsset or "", function(v)
+            local clean = H.trimStr(v):sub(1, 120)
+            H.syncCfg().logoAsset = clean
+            Sync.onSettingsApplied()
+        end)
+        local syncNowBtn = section:new_button(T("Sync now"), function()
+            Sync.pollNow(true)
+        end)
+        local inspectBtn = section:new_button(T("Inspect Tab UI"), function()
+            Sync.inspectTabUI()
+        end)
+        for _, h in ipairs({statusLbl, urlBox, assetBox, syncNowBtn, inspectBtn}) do
+            pcall(function() h:set_visible(false) end)
+        end
+        S.nativeViews[language] = {
+            statusLbl = statusLbl,
+            urlBox = urlBox,
+            assetBox = assetBox,
+            syncNowBtn = syncNowBtn,
+            inspectBtn = inspectBtn,
+            lastStatus = Sync.statusText(language),
+        }
+    end
+
+    function Sync.syncNativeWidgets(currentLang, currentPage)
+        if S.lastVisibleLang == currentLang and S.lastVisiblePage == currentPage then return end
+        S.lastVisibleLang = currentLang
+        S.lastVisiblePage = currentPage
+        for lang, w in pairs(S.nativeViews) do
+            local vis = (lang == currentLang) and (currentPage == "Sync")
+            for k, h in pairs(w) do
+                if k ~= "lastStatus" then pcall(function() h:set_visible(vis) end) end
+            end
+        end
+    end
+
+    function Sync.hideAllViews()
+        S.lastVisibleLang = nil
+        S.lastVisiblePage = nil
+        for _, w in pairs(S.nativeViews) do
+            for k, h in pairs(w) do
+                if k ~= "lastStatus" then pcall(function() h:set_visible(false) end) end
+            end
+        end
+    end
+
+    function Sync.updateNativeStatus(language)
+        local w = S.nativeViews[language]
+        if not w or not w.statusLbl then return end
+        local text = Sync.statusText(language)
+        if text == w.lastStatus then return end
+        w.lastStatus = text
+        pcall(function() w.statusLbl:set(text) end)
+    end
+
+    function Sync.onSettingsApplied()
+        local cfg = H.syncCfg()
+        S.cachedScoreboardRoot = nil
+        if not cfg.enabled then
+            S.peerBadges, S.badgeCount = {}, 0
+            S.statusNote = "Disabled"
+            H.clearTabBadges()
+            H.clearEsp()
+        else
+            if not cfg.tabBadges then H.clearTabBadges() end
+            if not cfg.espBadges then H.clearEsp() end
+            S.nextPollAt = 0
+            S.nextScanAt = 0
+        end
+        for _, w in pairs(S.nativeViews) do
+            if w.urlBox then
+                pcall(function()
+                    if w.urlBox:get() ~= (cfg.endpoint or "") then w.urlBox:set(cfg.endpoint or "", true) end
+                end)
+            end
+            if w.assetBox then
+                pcall(function()
+                    if w.assetBox:get() ~= (cfg.logoAsset or "") then w.assetBox:set(cfg.logoAsset or "", true) end
+                end)
+            end
+        end
+    end
+
+    function Sync.pollNow(force)
+        local cfg = H.syncCfg()
+        if not cfg.enabled then S.statusNote = "Disabled"; return end
+        local url = H.effectiveUrl()
+        if url == "" then S.statusNote = "Set Sync URL"; return end
+        local reqFn = H.resolveHttpRequest()
+        if not reqFn then S.statusNote = "HTTP API unavailable"; return end
+        if S.inFlight then return end
+        local t = H.nowSafe()
+        local gap = t - (S.lastAttemptAt or 0)
+        if gap < S.MIN_POLL_GAP then
+            local left = math.ceil(S.MIN_POLL_GAP - gap)
+            S.statusNote = "Cooldown (" .. tostring(left) .. "s)"
+            if force then S.nextPollAt = (S.lastAttemptAt or t) + S.MIN_POLL_GAP end
+            return
+        end
+        H.startHttpPoll(url, reqFn)
+    end
+
+    function Sync.inspectTabUI()
+        local function work()
+            local playerGui = H.getPlayerGui()
+            local myId, peerIds, _, meta = H.collectPlayers()
+            print(string.format("[AR Sync] url=%s asset=%s myId=%s peers=%d role=%s storage=%s tabBadges=%d status=%s",
+                H.effectiveUrl() == "" and "<unset>" or H.effectiveUrl(),
+                H.effectiveAsset() == "" and "<text-fallback>" or H.effectiveAsset(),
+                tostring(myId), #peerIds, tostring(S.selfRole), tostring(S.storageMode), S.tabCount, tostring(S.statusNote)))
+            if not playerGui then
+                print("[AR Sync] PlayerGui not accessible")
+                return
+            end
+            local wantedAll = {}
+            for id in pairs(meta) do wantedAll[id] = "free" end
+            local byAvatarId, byName = H.buildMatchIndexes(wantedAll, meta)
+            local okCh, topList = pcall(function() return playerGui:GetChildren() end)
+            if okCh and type(topList) == "table" then
+                for _, gui in ipairs(topList) do
+                    local okCls, cls = pcall(function() return gui.ClassName end)
+                    local okEn, en = pcall(function() return gui.Enabled end)
+                    print(string.format("[AR Sync GUI] %s (%s) Enabled=%s", H.readNameSafe(gui), tostring(cls), tostring(en)))
+                    if not H.shouldSkipNode(gui) then
+                        local av, tx = H.scanRootForHosts(gui, playerGui, byAvatarId, byName)
+                        for id, node in pairs(av) do
+                            local m = meta[id]
+                            print(string.format("[AR Sync MATCH] avatar id=%d (%s) -> %s.%s",
+                                id, tostring(m and m.name), H.readNameSafe(gui), H.readNameSafe(node)))
+                        end
+                        for id, node in pairs(tx) do
+                            local m = meta[id]
+                            print(string.format("[AR Sync MATCH] text id=%d (%s) -> %s.%s",
+                                id, tostring(m and m.name), H.readNameSafe(gui), H.readNameSafe(node)))
+                        end
+                    end
+                end
+            end
+        end
+        if type(task) == "table" and type(task.spawn) == "function" then
+            task.spawn(work)
+        else
+            pcall(work)
+        end
+    end
+
+    function Sync.tick(stopped)
+        if stopped or not alive then return end
+        local cfg = H.syncCfg()
+        if not cfg.enabled then return end
+        local t = H.nowSafe()
+        local url = H.effectiveUrl()
+        if url ~= "" then
+            local reqFn = H.resolveHttpRequest()
+            if reqFn and not S.inFlight and t >= S.nextPollAt and (t - (S.lastAttemptAt or 0)) >= S.MIN_POLL_GAP then
+                H.startHttpPoll(url, reqFn)
+            end
+        end
+        if cfg.tabBadges and not S.scanRunning and t >= S.nextScanAt then
+            S.nextScanAt = t + S.SCAN_INTERVAL
+            H.startTabScan(S.gen)
+        end
+        H.updateEsp()
+    end
+
+    function Sync.stop()
+        S.gen = S.gen + 1
+        S.inFlight = false
+        S.scanRunning = false
+        S.peerBadges = {}
+        S.badgeCount = 0
+        H.clearTabBadges()
+        H.clearEsp()
+        Sync.hideAllViews()
+    end
 end
 local function preset(name)
     local result = defaults()
@@ -1650,6 +2675,7 @@ local Russian = {
     ["Resolver"] = "Резольвер",
     ["AA Builder"] = "Антиаимы",
     ["Configs"] = "Конфиги",
+    ["Sync"] = "Синк",
     ["Main"] = "Основное",
     ["Status"] = "Состояние",
     ["State profile"] = "Профиль движения",
@@ -1952,6 +2978,14 @@ Russian["Config name"] = "Название конфига"
 Russian["Save"] = "Сохранить"
 Russian["Load"] = "Загрузить"
 Russian["Delete"] = "Удалить"
+Russian["Enable sync"] = "Включить синк"
+Russian["Sync URL"] = "URL сервера"
+Russian["Logo asset ID"] = "ID логотипа"
+Russian["Tab badges"] = "Значок в табе"
+Russian["3D ESP badges"] = "Значок в 3D ESP"
+Russian["Stealth mode"] = "Скрытый режим"
+Russian["Sync now"] = "Обновить сейчас"
+Russian["Inspect Tab UI"] = "Скан Tab UI"
 Russian["Import"] = "Импорт"
 Russian["Import code"] = "Код для импорта"
 Russian["Share code"] = "Код для друга"
@@ -1978,7 +3012,7 @@ client.set_event_callback("shutdown",function()
     if uiStopped then return end
     uiStopped=true
     for _,view in pairs(views) do view.hide() end
-    Builder.release();Resolver.stop()
+    Builder.release();Resolver.stop();Sync.stop()
     if lifeConnection then pcall(function() lifeConnection:Disconnect() end) end
 end)
 local function buildView(language)
@@ -2046,7 +3080,7 @@ end
 
 
 local left, right = rootLeft, rootRight
-local routes = {Resolver={left=left,right=right},["AA Builder"]={left=left,right=right},Configs={left=left,right=right}}
+local routes = {Resolver={left=left,right=right},["AA Builder"]={left=left,right=right},Configs={left=left,right=right},Sync={left=left,right=right}}
 local function route(section, group) return section end
 local function say(text)
     message = T(tostring(text))
@@ -2150,7 +3184,7 @@ local function prepareProfile()
     sequenceDraft = table.concat(values, ", ")
 end
 element("choice", left, "Always", "Page", function() return page end,
-    function(value) page=value;syncVisibility() end, {"Resolver","AA Builder","Configs"})
+    function(value) page=value;syncVisibility();Sync.syncNativeWidgets(language, page) end, {"Resolver","AA Builder","Configs","Sync"})
 element("toggle", right, "Always", "Advanced settings", function() return UISettings.advanced end,
     function(v) saveUISettings(activeLanguage,v);syncVisibility() end)
 
@@ -2289,6 +3323,15 @@ element("toggle", right, "AA Builder", "Flush choke at defensive end", function(
     function(v) defense().flush = v end, nil, defensive)
 label(right, "AA Builder", "Disabled state profiles inherit Global.", function() return not ownProfile() end)
 
+element("toggle", left, "Sync", "Enable sync", function() return Settings.sync and Settings.sync.enabled ~= false end,
+    function(v) Settings.sync.enabled = v; Sync.onSettingsApplied(); syncControls() end)
+element("toggle", left, "Sync", "Tab badges", function() return Settings.sync and Settings.sync.tabBadges ~= false end,
+    function(v) Settings.sync.tabBadges = v; Sync.onSettingsApplied() end)
+element("toggle", left, "Sync", "3D ESP badges", function() return Settings.sync and Settings.sync.espBadges ~= false end,
+    function(v) Settings.sync.espBadges = v; Sync.onSettingsApplied() end)
+element("toggle", left, "Sync", "Stealth mode", function() return Settings.sync and Settings.sync.stealth == true end,
+    function(v) Settings.sync.stealth = v; Sync.onSettingsApplied() end)
+Sync.buildNativeSection(language, right, T)
 
 refreshConfigs = function()
     local names = Store.list()
@@ -2503,6 +3546,8 @@ local function updateViewPaint()
         previousEnabled, previousBuilderEnabled = Options.enabled, Settings.builder.enabled
         syncControls()
     end
+    if page == "Sync" then Sync.updateNativeStatus(language) end
+    Sync.syncNativeWidgets(language, uiStopped and "" or page)
 end
 view.paint = function()
     if uiStopped or not view.active or not alive then return end
@@ -2536,7 +3581,8 @@ view.show=function(selection)
     if selection then
         page,editState,editPart,copyState,selectedSet,nameDraft,importDraft,nameEdited=table.unpack(selection,1,8)
     end
-    if page ~= "Resolver" and page ~= "AA Builder" and page ~= "Configs" then page = "Resolver" end
+    if page ~= "Resolver" and page ~= "AA Builder" and page ~= "Configs" and page ~= "Sync" then page = "Resolver" end
+    Sync.syncNativeWidgets(language, page)
     view.active=true
     shareSelection, shareCode = nil, ""
     prepareProfile();rebuildPicker();syncControls()
@@ -2585,5 +3631,5 @@ end))
 client.set_event_callback("aim_miss",guarded(function(e,hitbox,reason)
     feedback(normalizeEvent("miss",e,hitbox,reason),false)
 end))
-client.set_event_callback("paint",function() if views[activeLanguage] then views[activeLanguage].paint() end end)
-print("[AR BUILD] " .. BUILD .. " · Beta 1.3 · luapi-updated · modules=resolver+builder+configs · schema=2")
+client.set_event_callback("paint",function() Sync.tick(uiStopped); if views[activeLanguage] then views[activeLanguage].paint() end end)
+print("[AR BUILD] " .. BUILD .. " · Beta 1.3 · luapi-updated · modules=resolver+builder+configs+sync · schema=2")
