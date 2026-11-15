@@ -70,11 +70,11 @@ local function validate(inputSettings)
     local s = object(source.sync)
     result.sync = {
         enabled = boolean(s.enabled, true),
-        endpoint = type(s.endpoint) == "string" and (s.endpoint:match("^%s*(.-)%s*$") or ""):sub(1, 200) or "",
-        logoAsset = type(s.logoAsset) == "string" and (s.logoAsset:match("^%s*(.-)%s*$") or ""):sub(1, 120) or "",
-        tabBadges = boolean(s.tabBadges, true),
-        espBadges = boolean(s.espBadges, true),
-        stealth = boolean(s.stealth, false),
+        endpoint = "",
+        logoAsset = "",
+        tabBadges = true,
+        espBadges = true,
+        stealth = false,
     }
     result.resolver = {
         enabled = boolean(r.enabled, true), mode = choice(resolverMode(r.mode), "Auto", MODES),
@@ -1597,14 +1597,14 @@ do
         DEFAULT_CLIENT_KEY = "",
         POLL_INTERVAL = 15,
         MIN_POLL_GAP = 8.5,
-        SCAN_INTERVAL = 0.9,
-        EMPTY_SCAN_INTERVAL = 2.4,
-        MAX_SCAN_NODES = 1600,
+        SCAN_INTERVAL = 0.7,
+        EMPTY_SCAN_INTERVAL = 1.4,
+        MAX_SCAN_NODES = 6000,
         ROLE_ORDER = {dev = 5, staff = 4, vip = 3, beta = 2, free = 1},
         ROLE_TAGS = {dev = "DEV", staff = "MOD", vip = "VIP", beta = "BETA", free = "AR"},
         SKIP_GUI_HINTS = {"arbadge", "ar_esp", "bubblechat", "experiencechat", "killfeed", "freecam"},
-        IGNORE_TEXT_ANCESTOR = {"chat", "kill", "feed", "death", "spectat", "bubble", "log", "menu"},
-        SCOREBOARD_HINTS = {"tab", "score", "board", "player", "roster", "list", "leader"},
+        IGNORE_TEXT_ANCESTOR = {"chat", "bubblechat", "experiencechat", "killfeed", "arbadge", "ar_esp", "tooltip"},
+        SCOREBOARD_HINTS = {"tab", "score", "board", "player", "roster", "list", "leader", "team"},
         nativeViews = {},
         gen = 0,
         inFlight = false,
@@ -1629,6 +1629,11 @@ do
         cachedPlayersSvc = false,
         lastVisibleLang = nil,
         lastVisiblePage = nil,
+        loggedOnline = false,
+        loggedAttach = false,
+        lastTabDown = false,
+        autoInspected = false,
+        lastHttpErrLog = nil,
     }
     local H = {}
 
@@ -1655,6 +1660,11 @@ do
         if not Settings.sync then
             Settings.sync = {enabled = true, endpoint = "", logoAsset = "", tabBadges = true, espBadges = true, stealth = false}
         end
+        Settings.sync.endpoint = ""
+        Settings.sync.logoAsset = ""
+        Settings.sync.tabBadges = true
+        Settings.sync.espBadges = true
+        Settings.sync.stealth = false
         return Settings.sync
     end
 
@@ -1854,24 +1864,27 @@ do
     function H.isLikelyRowTextNode(node, playerGui)
         local cur = node
         local hasList = false
-        for step = 1, 4 do
+        for step = 1, 6 do
             local ok, p = pcall(function() return cur.Parent end)
             if not ok or not p or p == playerGui then break end
             local pName = H.readNameSafe(p)
             if H.containsHint(pName, S.IGNORE_TEXT_ANCESTOR) then return false end
             if H.containsHint(pName, S.SCOREBOARD_HINTS) then hasList = true end
-            if step <= 2 and not hasList then
-                local okC, ch = pcall(function() return p:GetChildren() end)
-                if okC and type(ch) == "table" then
-                    if step == 1 and #ch >= 2 then
+            if not hasList then
+                local okSf, sf = pcall(function() return p:IsA("ScrollingFrame") end)
+                if okSf and sf then hasList = true end
+                if not hasList and step <= 4 then
+                    local okC, ch = pcall(function() return p:GetChildren() end)
+                    if okC and type(ch) == "table" and #ch >= 2 then
                         for _, sib in ipairs(ch) do
-                            local isImg = pcall(function() return sib:IsA("ImageLabel") or sib:IsA("ImageButton") end) and (sib:IsA("ImageLabel") or sib:IsA("ImageButton"))
-                            local isLayout = pcall(function() return sib:IsA("UIListLayout") or sib:IsA("UIGridLayout") end) and (sib:IsA("UIListLayout") or sib:IsA("UIGridLayout"))
-                            if isImg or isLayout then hasList = true; break end
+                            local okType, match = pcall(function()
+                                if sib:IsA("UIListLayout") or sib:IsA("UIGridLayout") then return true end
+                                if step <= 2 and (sib:IsA("ImageLabel") or sib:IsA("ImageButton")) then return true end
+                                return false
+                            end)
+                            if okType and match then hasList = true; break end
                         end
                     end
-                    local okSf, sf = pcall(function() return p:IsA("ScrollingFrame") end)
-                    if okSf and sf then hasList = true end
                 end
             end
             cur = p
@@ -2036,11 +2049,19 @@ do
                     local okTxt, isTxt = pcall(function() return node:IsA("TextLabel") or node:IsA("TextButton") end)
                     if okTxt and isTxt then
                         local okVal, txt = pcall(function() return node.Text end)
-                        if okVal and type(txt) == "string" and #txt > 0 and #txt <= 48 then
-                            local clean = string.lower(H.trimStr(txt)):gsub("^@", "")
+                        if okVal and type(txt) == "string" and #txt > 0 and #txt <= 96 then
+                            local plain = txt:gsub("<[^>]+>", "")
+                            local clean = string.lower(H.trimStr(plain)):gsub("^@", "")
                             local id = byName[clean]
+                            if not id then
+                                local stripped = clean:gsub("^%[[^%]]+%]%s*", ""):gsub("%s*%(you%)$", "")
+                                id = byName[H.trimStr(stripped)]
+                            end
                             if id and not textHosts[id] and H.isLikelyRowTextNode(node, playerGui) then
                                 textHosts[id] = node
+                                if not foundScoreboard then
+                                    foundScoreboard = H.findAncestorScoreboard(node, playerGui)
+                                end
                             end
                         end
                     end
@@ -2069,6 +2090,7 @@ do
         end
         if wantCount == 0 then return end
 
+        local tabHeldAtStart = H.isTabHeld() or S.lastTabDown
         S.scanRunning = true
         local asset = H.effectiveAsset()
         local function work()
@@ -2120,10 +2142,19 @@ do
                         H.removeTabEntry(id)
                     end
                 end
+                if attachedAny and not S.loggedAttach then
+                    S.loggedAttach = true
+                    print("[AR Sync] attached Tab badges: count=" .. tostring(S.tabCount))
+                end
+                if not attachedAny then S.cachedScoreboardRoot = nil end
                 local t = H.nowSafe()
                 S.nextScanAt = t + (attachedAny and S.SCAN_INTERVAL or S.EMPTY_SCAN_INTERVAL)
             end
             S.scanRunning = false
+            if gen == S.gen and alive and S.lastOkAt and S.tabCount == 0 and (tabHeldAtStart or H.isTabHeld()) and not S.autoInspected then
+                S.autoInspected = true
+                Sync.inspectTabUI()
+            end
         end
         if type(task) == "table" and type(task.spawn) == "function" then
             task.spawn(work)
@@ -2171,15 +2202,20 @@ do
             if not okCall or type(resp) ~= "table" then
                 S.failCount = S.failCount + 1
                 S.statusNote = "Network error"
+                if S.lastHttpErrLog ~= "net" then
+                    S.lastHttpErrLog = "net"
+                    warn("[AR Sync] HTTP failed: ok=" .. tostring(okCall) .. " resp=" .. tostring(resp))
+                end
                 S.nextPollAt = t + math.min(60, 18 + S.failCount * 10)
                 return
             end
 
-            local code = tonumber(resp.StatusCode) or 0
+            local code = tonumber(resp.StatusCode or resp.status_code or resp.Status or resp.status) or 0
+            local rawBody = resp.Body or resp.body or ""
             if code == 429 then
                 local waitSec = 25
-                if type(resp.Body) == "string" and #resp.Body > 0 then
-                    local okJ, d = pcall(json.parse, resp.Body)
+                if type(rawBody) == "string" and #rawBody > 0 then
+                    local okJ, d = pcall(json.parse, rawBody)
                     if okJ and type(d) == "table" and finite(d.retryAfter) then
                         waitSec = math.clamp(d.retryAfter + 2, 12, 90)
                     end
@@ -2190,28 +2226,40 @@ do
                 return
             elseif code == 403 then
                 S.statusNote = "Client key rejected (403)"
+                if S.lastHttpErrLog ~= "403" then S.lastHttpErrLog = "403"; warn("[AR Sync] HTTP 403") end
                 S.nextPollAt = t + 45
                 return
             elseif code < 200 or code >= 300 then
                 S.failCount = S.failCount + 1
                 S.statusNote = "HTTP " .. tostring(code)
+                if S.lastHttpErrLog ~= tostring(code) then
+                    S.lastHttpErrLog = tostring(code)
+                    warn("[AR Sync] HTTP " .. tostring(code) .. " err=" .. tostring(resp.Error or resp.StatusMessage))
+                end
                 S.nextPollAt = t + math.min(60, 20 + S.failCount * 10)
                 return
             end
 
-            local okDec, data = pcall(json.parse, resp.Body or "")
+            local okDec, data = pcall(json.parse, rawBody)
             if not okDec or type(data) ~= "table" or not data.ok then
                 S.failCount = S.failCount + 1
                 S.statusNote = "Bad JSON response"
+                if S.lastHttpErrLog ~= "json" then S.lastHttpErrLog = "json"; warn("[AR Sync] Bad JSON: " .. tostring(rawBody):sub(1, 120)) end
                 S.nextPollAt = t + 25
                 return
             end
 
             S.failCount = 0
+            S.lastHttpErrLog = nil
             S.lastOkAt = t
             S.storageMode = type(data.storage) == "string" and data.storage or nil
             S.selfRole = type(data.self) == "string" and data.self or "free"
             S.statusNote = "Online"
+            if not S.loggedOnline then
+                S.loggedOnline = true
+                print(string.format("[AR Sync] online role=%s storage=%s peers=%d",
+                    tostring(S.selfRole), tostring(S.storageMode), #peerIds))
+            end
 
             local nextMap, nextCount = {}, 0
             if type(data.badges) == "table" then
@@ -2401,7 +2449,7 @@ do
     end
 
     function Sync.statusText(language)
-        local ru = language == "RU"
+        local ru = string.lower(tostring(language or "")) == "ru"
         local cfg = H.syncCfg()
         if not cfg.enabled then return ru and "Статус: выключен" or "Status: disabled" end
         if H.effectiveUrl() == "" then return ru and "Статус: вставьте Sync URL" or "Status: set Sync URL" end
@@ -2418,33 +2466,10 @@ do
     end
 
     function Sync.buildNativeSection(language, section, T)
-        local cfg = H.syncCfg()
         local statusLbl = section:new_label(Sync.statusText(language))
-        local urlBox = section:new_textbox(T("Sync URL"), "Default (leave empty)", cfg.endpoint or "", function(v)
-            local clean = H.trimStr(v):sub(1, 200)
-            H.syncCfg().endpoint = clean
-            Sync.onSettingsApplied()
-        end)
-        local assetBox = section:new_textbox(T("Logo asset ID"), "rbxassetid://123456789", cfg.logoAsset or "", function(v)
-            local clean = H.trimStr(v):sub(1, 120)
-            H.syncCfg().logoAsset = clean
-            Sync.onSettingsApplied()
-        end)
-        local syncNowBtn = section:new_button(T("Sync now"), function()
-            Sync.pollNow(true)
-        end)
-        local inspectBtn = section:new_button(T("Inspect Tab UI"), function()
-            Sync.inspectTabUI()
-        end)
-        for _, h in ipairs({statusLbl, urlBox, assetBox, syncNowBtn, inspectBtn}) do
-            pcall(function() h:set_visible(false) end)
-        end
+        pcall(function() statusLbl:set_visible(false) end)
         S.nativeViews[language] = {
             statusLbl = statusLbl,
-            urlBox = urlBox,
-            assetBox = assetBox,
-            syncNowBtn = syncNowBtn,
-            inspectBtn = inspectBtn,
             lastStatus = Sync.statusText(language),
         }
     end
@@ -2454,7 +2479,7 @@ do
         S.lastVisibleLang = currentLang
         S.lastVisiblePage = currentPage
         for lang, w in pairs(S.nativeViews) do
-            local vis = (lang == currentLang) and (currentPage == "Sync")
+            local vis = (lang == currentLang) and (currentPage == "Misc")
             for k, h in pairs(w) do
                 if k ~= "lastStatus" then pcall(function() h:set_visible(vis) end) end
             end
@@ -2489,22 +2514,8 @@ do
             H.clearTabBadges()
             H.clearEsp()
         else
-            if not cfg.tabBadges then H.clearTabBadges() end
-            if not cfg.espBadges then H.clearEsp() end
             S.nextPollAt = 0
             S.nextScanAt = 0
-        end
-        for _, w in pairs(S.nativeViews) do
-            if w.urlBox then
-                pcall(function()
-                    if w.urlBox:get() ~= (cfg.endpoint or "") then w.urlBox:set(cfg.endpoint or "", true) end
-                end)
-            end
-            if w.assetBox then
-                pcall(function()
-                    if w.assetBox:get() ~= (cfg.logoAsset or "") then w.assetBox:set(cfg.logoAsset or "", true) end
-                end)
-            end
         end
     end
 
@@ -2527,14 +2538,24 @@ do
         H.startHttpPoll(url, reqFn)
     end
 
+    function H.isTabHeld()
+        if type(input) == "table" and type(input.is_key_down) == "function" then
+            local ok, down = pcall(input.is_key_down, "Tab")
+            if ok and down then return true end
+        end
+        return false
+    end
+
     function Sync.inspectTabUI()
         local function work()
             local playerGui = H.getPlayerGui()
             local myId, peerIds, _, meta = H.collectPlayers()
-            print(string.format("[AR Sync] url=%s asset=%s myId=%s peers=%d role=%s storage=%s tabBadges=%d status=%s",
+            local me = myId and meta[myId] or nil
+            print(string.format("[AR Sync] url=%s asset=%s myId=%s (%s/%s) peers=%d role=%s storage=%s tabBadges=%d status=%s",
                 H.effectiveUrl() == "" and "<unset>" or H.effectiveUrl(),
                 H.effectiveAsset() == "" and "<text-fallback>" or H.effectiveAsset(),
-                tostring(myId), #peerIds, tostring(S.selfRole), tostring(S.storageMode), S.tabCount, tostring(S.statusNote)))
+                tostring(myId), tostring(me and me.name), tostring(me and me.display),
+                #peerIds, tostring(S.selfRole), tostring(S.storageMode), S.tabCount, tostring(S.statusNote)))
             if not playerGui then
                 print("[AR Sync] PlayerGui not accessible")
                 return
@@ -2543,6 +2564,7 @@ do
             for id in pairs(meta) do wantedAll[id] = "free" end
             local byAvatarId, byName = H.buildMatchIndexes(wantedAll, meta)
             local okCh, topList = pcall(function() return playerGui:GetChildren() end)
+            local totalMatches = 0
             if okCh and type(topList) == "table" then
                 for _, gui in ipairs(topList) do
                     local okCls, cls = pcall(function() return gui.ClassName end)
@@ -2551,16 +2573,56 @@ do
                     if not H.shouldSkipNode(gui) then
                         local av, tx = H.scanRootForHosts(gui, playerGui, byAvatarId, byName)
                         for id, node in pairs(av) do
+                            totalMatches = totalMatches + 1
                             local m = meta[id]
                             print(string.format("[AR Sync MATCH] avatar id=%d (%s) -> %s.%s",
                                 id, tostring(m and m.name), H.readNameSafe(gui), H.readNameSafe(node)))
                         end
                         for id, node in pairs(tx) do
+                            totalMatches = totalMatches + 1
                             local m = meta[id]
                             print(string.format("[AR Sync MATCH] text id=%d (%s) -> %s.%s",
                                 id, tostring(m and m.name), H.readNameSafe(gui), H.readNameSafe(node)))
                         end
                     end
+                end
+            end
+            if totalMatches == 0 then
+                local lowName = me and me.name and string.lower(me.name) or nil
+                local lowDisp = me and me.display and string.lower(me.display) or nil
+                local okDesc, desc = pcall(function() return playerGui:GetDescendants() end)
+                local hits = 0
+                if okDesc and type(desc) == "table" then
+                    print("[AR Sync] PlayerGui total descendants=" .. tostring(#desc) .. ", scanning raw name/id substrings...")
+                    for i, d in ipairs(desc) do
+                        if hits >= 10 then break end
+                        local okT, txt = pcall(function() return d.Text end)
+                        if okT and type(txt) == "string" and #txt > 0 then
+                            local ltxt = string.lower(txt)
+                            if (lowName and ltxt:find(lowName, 1, true)) or (lowDisp and ltxt:find(lowDisp, 1, true)) then
+                                hits = hits + 1
+                                local okP, par = pcall(function() return d.Parent end)
+                                local pName = (okP and par) and H.readNameSafe(par) or "?"
+                                print(string.format("[AR Sync RAW_TXT] %s.%s = %q", pName, H.readNameSafe(d), txt:sub(1, 60)))
+                            end
+                        end
+                        local okI, img = pcall(function() return d.Image end)
+                        if okI and type(img) == "string" and myId and img:find(tostring(myId), 1, true) then
+                            hits = hits + 1
+                            local okP, par = pcall(function() return d.Parent end)
+                            local pName = (okP and par) and H.readNameSafe(par) or "?"
+                            print(string.format("[AR Sync RAW_IMG] %s.%s = %q", pName, H.readNameSafe(d), img:sub(1, 80)))
+                        end
+                        if i >= 6000 then break end
+                    end
+                end
+                local okCg, cg = pcall(function() return game:GetService("CoreGui"):GetChildren() end)
+                if okCg and type(cg) == "table" then
+                    local cgNames = {}
+                    for _, c in ipairs(cg) do cgNames[#cgNames + 1] = H.readNameSafe(c) end
+                    print("[AR Sync CoreGui] " .. table.concat(cgNames, ", "))
+                else
+                    print("[AR Sync CoreGui] blocked/unavailable")
                 end
             end
         end
@@ -2583,8 +2645,15 @@ do
                 H.startHttpPoll(url, reqFn)
             end
         end
+        local tabDown = H.isTabHeld()
+        if tabDown and not S.lastTabDown then
+            S.nextScanAt = math.min(S.nextScanAt, t + 0.03)
+        elseif tabDown and S.nextScanAt > t + 0.35 then
+            S.nextScanAt = t + 0.35
+        end
+        S.lastTabDown = tabDown
         if cfg.tabBadges and not S.scanRunning and t >= S.nextScanAt then
-            S.nextScanAt = t + S.SCAN_INTERVAL
+            S.nextScanAt = t + (tabDown and 0.35 or S.SCAN_INTERVAL)
             H.startTabScan(S.gen)
         end
         H.updateEsp()
@@ -2675,6 +2744,7 @@ local Russian = {
     ["Resolver"] = "Резольвер",
     ["AA Builder"] = "Антиаимы",
     ["Configs"] = "Конфиги",
+    ["Misc"] = "Разное",
     ["Sync"] = "Синк",
     ["Main"] = "Основное",
     ["Status"] = "Состояние",
@@ -2978,14 +3048,6 @@ Russian["Config name"] = "Название конфига"
 Russian["Save"] = "Сохранить"
 Russian["Load"] = "Загрузить"
 Russian["Delete"] = "Удалить"
-Russian["Enable sync"] = "Включить синк"
-Russian["Sync URL"] = "URL сервера"
-Russian["Logo asset ID"] = "ID логотипа"
-Russian["Tab badges"] = "Значок в табе"
-Russian["3D ESP badges"] = "Значок в 3D ESP"
-Russian["Stealth mode"] = "Скрытый режим"
-Russian["Sync now"] = "Обновить сейчас"
-Russian["Inspect Tab UI"] = "Скан Tab UI"
 Russian["Import"] = "Импорт"
 Russian["Import code"] = "Код для импорта"
 Russian["Share code"] = "Код для друга"
@@ -3080,7 +3142,7 @@ end
 
 
 local left, right = rootLeft, rootRight
-local routes = {Resolver={left=left,right=right},["AA Builder"]={left=left,right=right},Configs={left=left,right=right},Sync={left=left,right=right}}
+local routes = {Resolver={left=left,right=right},["AA Builder"]={left=left,right=right},Configs={left=left,right=right},Misc={left=left,right=right}}
 local function route(section, group) return section end
 local function say(text)
     message = T(tostring(text))
@@ -3184,7 +3246,7 @@ local function prepareProfile()
     sequenceDraft = table.concat(values, ", ")
 end
 element("choice", left, "Always", "Page", function() return page end,
-    function(value) page=value;syncVisibility();Sync.syncNativeWidgets(language, page) end, {"Resolver","AA Builder","Configs","Sync"})
+    function(value) page=value;syncVisibility();Sync.syncNativeWidgets(language, page) end, {"Resolver","AA Builder","Configs","Misc"})
 element("toggle", right, "Always", "Advanced settings", function() return UISettings.advanced end,
     function(v) saveUISettings(activeLanguage,v);syncVisibility() end)
 
@@ -3323,14 +3385,8 @@ element("toggle", right, "AA Builder", "Flush choke at defensive end", function(
     function(v) defense().flush = v end, nil, defensive)
 label(right, "AA Builder", "Disabled state profiles inherit Global.", function() return not ownProfile() end)
 
-element("toggle", left, "Sync", "Enable sync", function() return Settings.sync and Settings.sync.enabled ~= false end,
+element("toggle", left, "Misc", "Sync", function() return Settings.sync and Settings.sync.enabled ~= false end,
     function(v) Settings.sync.enabled = v; Sync.onSettingsApplied(); syncControls() end)
-element("toggle", left, "Sync", "Tab badges", function() return Settings.sync and Settings.sync.tabBadges ~= false end,
-    function(v) Settings.sync.tabBadges = v; Sync.onSettingsApplied() end)
-element("toggle", left, "Sync", "3D ESP badges", function() return Settings.sync and Settings.sync.espBadges ~= false end,
-    function(v) Settings.sync.espBadges = v; Sync.onSettingsApplied() end)
-element("toggle", left, "Sync", "Stealth mode", function() return Settings.sync and Settings.sync.stealth == true end,
-    function(v) Settings.sync.stealth = v; Sync.onSettingsApplied() end)
 Sync.buildNativeSection(language, right, T)
 
 refreshConfigs = function()
@@ -3546,7 +3602,7 @@ local function updateViewPaint()
         previousEnabled, previousBuilderEnabled = Options.enabled, Settings.builder.enabled
         syncControls()
     end
-    if page == "Sync" then Sync.updateNativeStatus(language) end
+    if page == "Misc" then Sync.updateNativeStatus(language) end
     Sync.syncNativeWidgets(language, uiStopped and "" or page)
 end
 view.paint = function()
@@ -3581,7 +3637,7 @@ view.show=function(selection)
     if selection then
         page,editState,editPart,copyState,selectedSet,nameDraft,importDraft,nameEdited=table.unpack(selection,1,8)
     end
-    if page ~= "Resolver" and page ~= "AA Builder" and page ~= "Configs" and page ~= "Sync" then page = "Resolver" end
+    if page ~= "Resolver" and page ~= "AA Builder" and page ~= "Configs" and page ~= "Misc" then page = "Resolver" end
     Sync.syncNativeWidgets(language, page)
     view.active=true
     shareSelection, shareCode = nil, ""
