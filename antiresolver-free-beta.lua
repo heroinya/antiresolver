@@ -1,5 +1,5 @@
--- AntiResolver Beta 1.3 | t.me/penaresolv
-local BUILD = "1.3-beta"
+-- AntiResolver Beta 1.3.1 | t.me/penaresolv
+local BUILD = "1.3.1-beta"
 local localPlayer = game:GetService("Players").LocalPlayer
 assert(localPlayer and type(localPlayer.UserId) == "number" and localPlayer.UserId > 0 and localPlayer.UserId % 1 == 0, "AntiResolver needs a signed-in local player")
 local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
@@ -3771,4 +3771,4 @@ client.set_event_callback("aim_miss",guarded(function(e,hitbox,reason)
     feedback(normalizeEvent("miss",e,hitbox,reason),false)
 end))
 client.set_event_callback("paint",function() Sync.tick(uiStopped); if views[activeLanguage] then views[activeLanguage].paint() end end)
-print("[AR BUILD] " .. BUILD .. " · Beta 1.3 · luapi-updated · modules=resolver+builder+configs+sync · schema=2")
+print("[AR BUILD] " .. BUILD .. " · Beta 1.3.1 · luapi-updated · modules=resolver+builder+configs+sync · schema=2")
