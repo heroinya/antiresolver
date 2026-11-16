@@ -1603,7 +1603,7 @@ do
         ROLE_ORDER = {dev = 5, staff = 4, vip = 3, beta = 2, free = 1},
         ROLE_TAGS = {dev = "DEV", staff = "MOD", vip = "VIP", beta = "BETA", free = "AR"},
         SKIP_GUI_HINTS = {"arbadge", "ar_esp", "bubblechat", "experiencechat", "killfeed", "freecam"},
-        IGNORE_TEXT_ANCESTOR = {"chat", "bubblechat", "experiencechat", "killfeed", "arbadge", "ar_esp", "tooltip"},
+        IGNORE_TEXT_ANCESTOR = {"chat", "bubblechat", "experiencechat", "killfeed", "killlog", "elimfeed", "arbadge", "ar_esp", "tooltip"},
         SCOREBOARD_HINTS = {"tab", "score", "board", "player", "roster", "list", "leader", "team"},
         nativeViews = {},
         gen = 0,
@@ -1624,13 +1624,12 @@ do
         espDrawings = {},
         espBillboards = {},
         billboardBroken = false,
-        cachedScoreboardRoot = nil,
         cachedHttpFn = false,
         cachedPlayersSvc = false,
         lastVisibleLang = nil,
         lastVisiblePage = nil,
         loggedOnline = false,
-        loggedAttach = false,
+        lastAttachSig = "",
         lastTabDown = false,
         autoInspected = false,
         lastHttpErrLog = nil,
@@ -1849,10 +1848,55 @@ do
         return H.containsHint(low, S.SKIP_GUI_HINTS)
     end
 
+    function H.isBranchVisible(inst)
+        local okEn, en = pcall(function() return inst.Enabled end)
+        if okEn and en == false then return false end
+        local okVis, vis = pcall(function() return inst.Visible end)
+        if okVis and vis == false then return false end
+        return true
+    end
+
+    function H.readNodeRect(inst)
+        local okS, sz = pcall(function() return inst.AbsoluteSize end)
+        if not okS or not sz or sz.X < 8 or sz.Y < 8 then return nil end
+        local okP, pos = pcall(function() return inst.AbsolutePosition end)
+        if not okP or not pos then return sz.X, sz.Y, 0, 0 end
+        if pos.X + sz.X <= 0 or pos.Y + sz.Y <= 0 then return nil end
+        return sz.X, sz.Y, pos.X, pos.Y
+    end
+
+    function H.readRowWidth(node, playerGui)
+        local cur = node
+        local maxW = 0
+        for _ = 1, 3 do
+            local ok, p = pcall(function() return cur.Parent end)
+            if not ok or not p or p == playerGui then break end
+            local okS, sz = pcall(function() return p.AbsoluteSize end)
+            if okS and sz and sz.X >= 140 and sz.Y >= 12 and sz.Y <= 64 and sz.X > maxW then
+                maxW = sz.X
+            end
+            cur = p
+        end
+        return maxW
+    end
+
+    function H.shortGuiPath(node, playerGui)
+        local parts = {}
+        local cur = node
+        for _ = 1, 12 do
+            if not cur or cur == playerGui then break end
+            table.insert(parts, 1, H.readNameSafe(cur))
+            local ok, p = pcall(function() return cur.Parent end)
+            if not ok then break end
+            cur = p
+        end
+        return table.concat(parts, ".")
+    end
+
     function H.findAncestorScoreboard(node, playerGui)
         local cur = node
         local best = nil
-        for _ = 1, 6 do
+        for _ = 1, 12 do
             local ok, p = pcall(function() return cur.Parent end)
             if not ok or not p or p == playerGui then break end
             if H.containsHint(H.readNameSafe(p), S.SCOREBOARD_HINTS) then best = p end
@@ -1864,16 +1908,20 @@ do
     function H.isLikelyRowTextNode(node, playerGui)
         local cur = node
         local hasList = false
-        for step = 1, 6 do
+        for step = 1, 10 do
             local ok, p = pcall(function() return cur.Parent end)
             if not ok or not p or p == playerGui then break end
             local pName = H.readNameSafe(p)
             if H.containsHint(pName, S.IGNORE_TEXT_ANCESTOR) then return false end
             if H.containsHint(pName, S.SCOREBOARD_HINTS) then hasList = true end
+            if not hasList and step <= 3 then
+                local okS, sz = pcall(function() return p.AbsoluteSize end)
+                if okS and sz and sz.X >= 160 and sz.Y >= 14 and sz.Y <= 60 then hasList = true end
+            end
             if not hasList then
                 local okSf, sf = pcall(function() return p:IsA("ScrollingFrame") end)
                 if okSf and sf then hasList = true end
-                if not hasList and step <= 4 then
+                if not hasList and step <= 5 then
                     local okC, ch = pcall(function() return p:GetChildren() end)
                     if okC and type(ch) == "table" and #ch >= 2 then
                         for _, sib in ipairs(ch) do
@@ -1922,9 +1970,9 @@ do
         end)
 
         local okMake, frame = pcall(function()
-            local zBase = 2
+            local zBase = 15
             pcall(function()
-                if finite(host.ZIndex) then zBase = math.min(50, math.max(1, host.ZIndex + 4)) end
+                if finite(host.ZIndex) then zBase = math.max(15, host.ZIndex + 15) end
             end)
             local color = H.roleColor(role)
             local f = Instance.new("Frame")
@@ -1934,13 +1982,38 @@ do
             f.BorderSizePixel = 0
             f.ZIndex = zBase
             if hostKind == "avatar" then
-                f.Size = asset ~= "" and UDim2.new(0, 16, 0, 16) or UDim2.new(0, 18, 0, 14)
+                f.Size = asset ~= "" and UDim2.new(0, 16, 0, 16) or UDim2.new(0, 20, 0, 13)
                 f.AnchorPoint = Vector2.new(1, 1)
                 f.Position = UDim2.new(1, 0, 1, 0)
             else
-                f.Size = UDim2.new(0, asset ~= "" and 18 or (role == "free" and 24 or 28), 0, asset ~= "" and 18 or 14)
-                f.AnchorPoint = Vector2.new(1, 0.5)
-                f.Position = UDim2.new(1, -2, 0.5, 0)
+                local hostW, tbX, clips = 0, 0, false
+                local align = "left"
+                pcall(function() if host.AbsoluteSize then hostW = host.AbsoluteSize.X end end)
+                pcall(function() if host.TextBounds then tbX = host.TextBounds.X end end)
+                pcall(function() clips = host.ClipsDescendants == true end)
+                pcall(function()
+                    if host.TextXAlignment == Enum.TextXAlignment.Center then align = "center"
+                    elseif host.TextXAlignment == Enum.TextXAlignment.Right then align = "right" end
+                end)
+                local bw = asset ~= "" and 16 or (role == "free" and 24 or 28)
+                local bh = asset ~= "" and 16 or 14
+                f.Size = UDim2.new(0, bw, 0, bh)
+                if tbX > 0 and align == "left" and hostW >= tbX + bw + 8 then
+                    f.AnchorPoint = Vector2.new(0, 0.5)
+                    f.Position = UDim2.new(0, math.floor(tbX + 6), 0.5, 0)
+                elseif tbX > 0 and align == "center" and hostW >= tbX + bw * 2 + 12 then
+                    f.AnchorPoint = Vector2.new(0, 0.5)
+                    f.Position = UDim2.new(0, math.floor((hostW + tbX) * 0.5 + 6), 0.5, 0)
+                elseif tbX > 0 and align == "right" and hostW >= tbX + bw + 8 then
+                    f.AnchorPoint = Vector2.new(1, 0.5)
+                    f.Position = UDim2.new(0, math.floor(hostW - tbX - 6), 0.5, 0)
+                elseif not clips then
+                    f.AnchorPoint = Vector2.new(0, 0.5)
+                    f.Position = UDim2.new(1, 4, 0.5, 0)
+                else
+                    f.AnchorPoint = Vector2.new(1, 0.5)
+                    f.Position = UDim2.new(1, -2, 0.5, 0)
+                end
             end
             pcall(function()
                 local corner = Instance.new("UICorner")
@@ -1958,7 +2031,7 @@ do
                 img.Position = UDim2.new(0, 0, 0, 0)
                 img.BackgroundTransparency = 1
                 img.Image = asset
-                img.ZIndex = zBase + 1
+                img.ZIndex = zBase + 2
                 pcall(function() img.ScaleType = Enum.ScaleType.Fit end)
                 pcall(function()
                     local ic = Instance.new("UICorner")
@@ -1972,18 +2045,11 @@ do
                 lbl.Size = UDim2.new(1, 0, 1, 0)
                 lbl.BackgroundTransparency = 1
                 lbl.Text = S.ROLE_TAGS[role] or "AR"
-                lbl.TextColor3 = role == "free" and Color3.fromRGB(255, 255, 255) or color
-                lbl.ZIndex = zBase + 1
+                lbl.TextColor3 = role == "free" and Color3.fromRGB(220, 242, 255) or color
+                lbl.ZIndex = zBase + 2
+                pcall(function() lbl.TextSize = 10 end)
                 pcall(function() lbl.TextScaled = true end)
                 pcall(function() lbl.Font = Enum.Font.GothamBold end)
-                if role == "free" then
-                    pcall(function()
-                        local grad = Instance.new("UIGradient")
-                        grad.Color = ColorSequence.new(Color3.fromRGB(224, 245, 255), Color3.fromRGB(44, 134, 246))
-                        grad.Rotation = 15
-                        grad.Parent = lbl
-                    end)
-                end
                 lbl.Parent = f
             end
             f.Parent = host
@@ -2021,16 +2087,38 @@ do
         return byAvatarId, byName
     end
 
-    function H.scanRootForHosts(root, playerGui, byAvatarId, byName)
-        local avatarHosts, textHosts = {}, {}
+    function H.scanRootForHosts(root, playerGui, byAvatarId, byName, includeHidden)
+        local avatarHosts, textHosts, scoredHosts = {}, {}, {}
+        if H.shouldSkipNode(root) or (not includeHidden and not H.isBranchVisible(root)) then
+            return avatarHosts, textHosts, nil, scoredHosts
+        end
         local queue = {root}
         local head, visited = 1, 0
         local foundScoreboard = nil
+        local function recordCandidate(id, node, kind, bonus)
+            local w, h, px, py = H.readNodeRect(node)
+            if not includeHidden and not w then return end
+            w, h, px, py = w or 0, h or 0, px or 0, py or 0
+            local sb = H.findAncestorScoreboard(node, playerGui)
+            local rowW = H.readRowWidth(node, playerGui)
+            local score = (sb and 200 or 0) + (rowW >= 160 and 120 or 20) + bonus
+            if kind == "avatar" and py >= 65 and h >= 14 then score = score + 30 end
+            if not foundScoreboard and sb then foundScoreboard = sb end
+            local cur = scoredHosts[id]
+            if not cur or score > cur.score then
+                scoredHosts[id] = {node = node, kind = kind, score = score, w = w, h = h, x = px, y = py}
+            end
+            if kind == "avatar" then
+                if not avatarHosts[id] then avatarHosts[id] = node end
+            elseif not textHosts[id] then
+                textHosts[id] = node
+            end
+        end
         while head <= #queue and visited < S.MAX_SCAN_NODES do
             local node = queue[head]
             head = head + 1
             visited = visited + 1
-            if not H.shouldSkipNode(node) then
+            if not H.shouldSkipNode(node) and (includeHidden or H.isBranchVisible(node)) then
                 local okImg, isImg = pcall(function() return node:IsA("ImageLabel") or node:IsA("ImageButton") end)
                 if okImg and isImg then
                     local okSrc, src = pcall(function() return node.Image end)
@@ -2038,11 +2126,7 @@ do
                         local low = string.lower(src)
                         local uidStr = low:match("id=(%d+)") or low:match("userid=(%d+)") or low:match("users/(%d+)")
                         if uidStr and byAvatarId[uidStr] then
-                            local id = byAvatarId[uidStr]
-                            avatarHosts[id] = node
-                            if not foundScoreboard then
-                                foundScoreboard = H.findAncestorScoreboard(node, playerGui)
-                            end
+                            recordCandidate(byAvatarId[uidStr], node, "avatar", 0)
                         end
                     end
                 else
@@ -2057,11 +2141,8 @@ do
                                 local stripped = clean:gsub("^%[[^%]]+%]%s*", ""):gsub("%s*%(you%)$", "")
                                 id = byName[H.trimStr(stripped)]
                             end
-                            if id and not textHosts[id] and H.isLikelyRowTextNode(node, playerGui) then
-                                textHosts[id] = node
-                                if not foundScoreboard then
-                                    foundScoreboard = H.findAncestorScoreboard(node, playerGui)
-                                end
+                            if id and H.isLikelyRowTextNode(node, playerGui) then
+                                recordCandidate(id, node, "text", 80)
                             end
                         end
                     end
@@ -2069,12 +2150,14 @@ do
                 local okCh, children = pcall(function() return node:GetChildren() end)
                 if okCh and type(children) == "table" then
                     for _, ch in ipairs(children) do
-                        queue[#queue + 1] = ch
+                        if not H.shouldSkipNode(ch) and (includeHidden or H.isBranchVisible(ch)) then
+                            queue[#queue + 1] = ch
+                        end
                     end
                 end
             end
         end
-        return avatarHosts, textHosts, foundScoreboard
+        return avatarHosts, textHosts, foundScoreboard, scoredHosts
     end
 
     function H.startTabScan(gen)
@@ -2097,56 +2180,56 @@ do
             if gen ~= S.gen or not alive then S.scanRunning = false; return end
             local byAvatarId, byName = H.buildMatchIndexes(wanted, meta)
             local roots = {}
-            if S.cachedScoreboardRoot then
-                local okDesc, inside = pcall(function() return S.cachedScoreboardRoot:IsDescendantOf(playerGui) end)
-                if okDesc and inside then
-                    roots[1] = S.cachedScoreboardRoot
-                else
-                    S.cachedScoreboardRoot = nil
-                end
-            end
-            if #roots == 0 then
-                local okCh, topList = pcall(function() return playerGui:GetChildren() end)
-                if okCh and type(topList) == "table" then
-                    local secondary = {}
-                    for _, gui in ipairs(topList) do
-                        if not H.shouldSkipNode(gui) then
-                            if H.containsHint(H.readNameSafe(gui), S.SCOREBOARD_HINTS) then
-                                roots[#roots + 1] = gui
-                            else
-                                secondary[#secondary + 1] = gui
-                            end
+            local okCh, topList = pcall(function() return playerGui:GetChildren() end)
+            if okCh and type(topList) == "table" then
+                local secondary = {}
+                for _, gui in ipairs(topList) do
+                    if not H.shouldSkipNode(gui) and H.isBranchVisible(gui) then
+                        if H.containsHint(H.readNameSafe(gui), S.SCOREBOARD_HINTS) then
+                            roots[#roots + 1] = gui
+                        else
+                            secondary[#secondary + 1] = gui
                         end
                     end
-                    for _, gui in ipairs(secondary) do roots[#roots + 1] = gui end
                 end
+                for _, gui in ipairs(secondary) do roots[#roots + 1] = gui end
             end
 
-            local mergedAvatar, mergedText = {}, {}
+            local bestById = {}
             for _, root in ipairs(roots) do
                 if gen ~= S.gen or not alive then break end
-                local av, tx, sb = H.scanRootForHosts(root, playerGui, byAvatarId, byName)
-                if sb and not S.cachedScoreboardRoot then S.cachedScoreboardRoot = sb end
-                for k, v in pairs(av) do if not mergedAvatar[k] then mergedAvatar[k] = v end end
-                for k, v in pairs(tx) do if not mergedText[k] then mergedText[k] = v end end
+                local _, _, _, scored = H.scanRootForHosts(root, playerGui, byAvatarId, byName, false)
+                for k, cand in pairs(scored) do
+                    local prev = bestById[k]
+                    if not prev or cand.score > prev.score then bestById[k] = cand end
+                end
             end
 
             if gen == S.gen and alive then
                 local attachedAny = false
+                local sample = nil
                 for id, role in pairs(wanted) do
-                    local host = mergedAvatar[id] or mergedText[id]
-                    local kind = mergedAvatar[id] and "avatar" or "text"
-                    if host then
-                        if H.attachTabBadge(id, host, kind, role, asset) then attachedAny = true end
+                    local cand = bestById[id]
+                    if cand then
+                        if H.attachTabBadge(id, cand.node, cand.kind, role, asset) then
+                            attachedAny = true
+                            if not sample or cand.score > sample.score then sample = cand end
+                        end
                     else
                         H.removeTabEntry(id)
                     end
                 end
-                if attachedAny and not S.loggedAttach then
-                    S.loggedAttach = true
-                    print("[AR Sync] attached Tab badges: count=" .. tostring(S.tabCount))
+                if attachedAny and sample then
+                    local path = H.shortGuiPath(sample.node, playerGui)
+                    local sig = tostring(S.tabCount) .. "|" .. path .. "|" .. tostring(sample.kind)
+                    if sig ~= S.lastAttachSig then
+                        S.lastAttachSig = sig
+                        print(string.format("[AR Sync] attached Tab badges: count=%d sample=%s (%s %.0fx%.0f @ %.0f,%.0f)",
+                            S.tabCount, path, tostring(sample.kind), sample.w, sample.h, sample.x, sample.y))
+                    end
+                else
+                    S.lastAttachSig = ""
                 end
-                if not attachedAny then S.cachedScoreboardRoot = nil end
                 local t = H.nowSafe()
                 S.nextScanAt = t + (attachedAny and S.SCAN_INTERVAL or S.EMPTY_SCAN_INTERVAL)
             end
@@ -2507,7 +2590,7 @@ do
 
     function Sync.onSettingsApplied()
         local cfg = H.syncCfg()
-        S.cachedScoreboardRoot = nil
+        S.lastAttachSig = ""
         if not cfg.enabled then
             S.peerBadges, S.badgeCount = {}, 0
             S.statusNote = "Disabled"
@@ -2571,18 +2654,18 @@ do
                     local okEn, en = pcall(function() return gui.Enabled end)
                     print(string.format("[AR Sync GUI] %s (%s) Enabled=%s", H.readNameSafe(gui), tostring(cls), tostring(en)))
                     if not H.shouldSkipNode(gui) then
-                        local av, tx = H.scanRootForHosts(gui, playerGui, byAvatarId, byName)
+                        local av, tx = H.scanRootForHosts(gui, playerGui, byAvatarId, byName, true)
                         for id, node in pairs(av) do
                             totalMatches = totalMatches + 1
                             local m = meta[id]
-                            print(string.format("[AR Sync MATCH] avatar id=%d (%s) -> %s.%s",
-                                id, tostring(m and m.name), H.readNameSafe(gui), H.readNameSafe(node)))
+                            print(string.format("[AR Sync MATCH] avatar id=%d (%s) -> %s",
+                                id, tostring(m and m.name), H.shortGuiPath(node, playerGui)))
                         end
                         for id, node in pairs(tx) do
                             totalMatches = totalMatches + 1
                             local m = meta[id]
-                            print(string.format("[AR Sync MATCH] text id=%d (%s) -> %s.%s",
-                                id, tostring(m and m.name), H.readNameSafe(gui), H.readNameSafe(node)))
+                            print(string.format("[AR Sync MATCH] text id=%d (%s) -> %s",
+                                id, tostring(m and m.name), H.shortGuiPath(node, playerGui)))
                         end
                     end
                 end
