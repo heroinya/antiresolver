@@ -1,5 +1,5 @@
--- AntiResolver Beta 1.3.1 | t.me/penaresolv
-local BUILD = "1.3.1-beta"
+-- AntiResolver Beta 1.4 | t.me/penaresolv
+local BUILD = "1.4-beta"
 local localPlayer = game:GetService("Players").LocalPlayer
 assert(localPlayer and type(localPlayer.UserId) == "number" and localPlayer.UserId > 0 and localPlayer.UserId % 1 == 0, "AntiResolver needs a signed-in local player")
 local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
@@ -258,11 +258,31 @@ function Store.encodeCode(settings, name)
     end
     return "PR2:" .. table.concat(out)
 end
+Store._ruMap = {
+    ["й"]="q",["ц"]="w",["у"]="e",["к"]="r",["е"]="t",["н"]="y",["г"]="u",["ш"]="i",["щ"]="o",["з"]="p",["х"]="[",["ъ"]="]",
+    ["ф"]="a",["ы"]="s",["в"]="d",["а"]="f",["п"]="g",["р"]="h",["о"]="j",["л"]="k",["д"]="l",["ж"]=";",["э"]="'",
+    ["я"]="z",["ч"]="x",["с"]="c",["м"]="v",["и"]="b",["т"]="n",["ь"]="m",["б"]=",",["ю"]=".",["ё"]="`",
+    ["Й"]="Q",["Ц"]="W",["У"]="E",["К"]="R",["Е"]="T",["Н"]="Y",["Г"]="U",["Ш"]="I",["Щ"]="O",["З"]="P",["Х"]="{",["Ъ"]="}",
+    ["Ф"]="A",["Ы"]="S",["В"]="D",["А"]="F",["П"]="G",["Р"]="H",["О"]="J",["Л"]="K",["Д"]="L",["Ж"]=":",["Э"]="\"",
+    ["Я"]="Z",["Ч"]="X",["С"]="C",["М"]="V",["И"]="B",["Т"]="N",["Ь"]="M",["Б"]="<",["Ю"]=">",["Ё"]="~",
+}
+function Store.normalizeLayout(text)
+    return (text:gsub("[\192-\255][\128-\191]*", Store._ruMap))
+end
 function Store.decodeCode(code)
     assert(type(code)=="string" and #code<=180000,"Invalid/oversized share code")
     code=code:match("^%s*(.-)%s*$")
-    if code:sub(1,4)~="PR2:" then return Store.decodeSet(code) end
-    code=code:gsub("%s","")
+    if code:sub(1,1)~="{" then
+        code=code:gsub('^["\'`]+', ""):gsub('["\'`]+$', "")
+        code=code:match("^%s*(.-)%s*$")
+    end
+    local mapped=Store.normalizeLayout(code)
+    if code:sub(1,4)~="PR2:" and mapped:sub(1,4)~="PR2:" then
+        local okRaw, valRaw, nameRaw=pcall(Store.decodeSet, code)
+        if okRaw then return valRaw, nameRaw end
+        return Store.decodeSet(mapped)
+    end
+    code=mapped:gsub("%s","")
     local raw=code:sub(5)
     assert(#raw>0 and #raw%4==0 and raw:match("^[A-Za-z0-9_%-]*=?=?$"),"Invalid PR2 code")
     local out={}
@@ -502,13 +522,14 @@ function Resolver.finishDT(group)
         end
         return false
     end
-    if group.sent < 2 and timestamp < group.lockUntil then return false end
+    if group.sent < (group.expectedShots or 2) and timestamp < group.lockUntil then return false end
     local hits, misses, ignored, head, failed = 0, 0, 0, nil, nil
     for _, result in ipairs(group.results) do
+        local resReason = type(result.reason) == "string" and string.lower(result.reason:match("^%s*(.-)%s*$") or "") or ""
         if result.hit then
             hits = hits + 1
             if result.hitbox == "head" then head = result.shot end
-        elseif result.reason == "resolver" then
+        elseif resReason == "resolver" then
             misses = misses + 1
             if not failed or result.hitbox ~= "head" then failed = result end
         else ignored = ignored + 1 end
@@ -533,13 +554,14 @@ function Resolver.finishDT(group)
         state.consecutive, ctx.misses = state.consecutive+1, ctx.misses+1
         if ctx.misses % Options.cycleAfter == 0 then
             local shot = failed.shot
+            local rejectFor = math.clamp(Options.memory * 0.4, 4, 8)
             ctx.revision = ctx.revision+1
             autoFeedback(ctx, shot.strategy, false)
             ctx.failedAngles[#ctx.failedAngles+1] = {offset=shot.offset,pitch=shot.pitch,
-                body=failed.hitbox~=nil and failed.hitbox~="head",expires=timestamp+3}
+                body=failed.hitbox~=nil and failed.hitbox~="head",expires=timestamp+rejectFor}
             if #ctx.failedAngles>32 then table.remove(ctx.failedAngles,1) end
             ctx.scores[shot.id] = math.max(-12,(ctx.scores[shot.id] or 0)-3)
-            ctx.rejected[shot.id], ctx.winner = timestamp+3, nil
+            ctx.rejected[shot.id], ctx.winner = timestamp+rejectFor, nil
             if shot.strategy=="Brute-force" then ctx.stage=ctx.stage%5+1 end
         end
     end
@@ -554,8 +576,13 @@ function Resolver.trackDT(shot, id, choice)
         local ok, active = pcall(weapon.get_active)
         if ok and type(active)=="table" then weaponKey=tostring(active.id or active.name or "unavailable") end
     end
+    local wLow = string.lower(weaponKey)
+    local singleShotWeapon = wLow:find("ssg", 1, true) ~= nil or wLow:find("awp", 1, true) ~= nil or wLow:find("scout", 1, true) ~= nil
+    local hasDtApi = type(rage) == "table" and type(rage.is_double_tap_charged) == "function"
+    local dtRecentlyCharged = not hasDtApi or (Resolver._lastDtChargedAt ~= nil and timestamp - Resolver._lastDtChargedAt <= 0.25)
+    local expectedShots = (singleShotWeapon or not dtRecentlyCharged) and 1 or 2
     local group = state.dtLock
-    if not group or group.closed or group.sent>=2 or timestamp>=group.lockUntil
+    if not group or group.closed or group.sent>=(group.expectedShots or 2) or timestamp>=group.lockUntil
         or group.context~=shot.context or group.revision~=shot.revision or group.life~=state.life
         or group.weapon~=weaponKey or group.pitchMode~=Options.pitch then
         local count, oldest = 0, nil
@@ -570,14 +597,15 @@ function Resolver.trackDT(shot, id, choice)
         Resolver.dt.sequence=Resolver.dt.sequence+1
         group={serial=Resolver.dt.sequence,state=state,life=state.life,character=state.character,
             context=shot.context,revision=shot.revision,choice=clone(choice),pitchMode=Options.pitch,
-            weapon=weaponKey,started=timestamp,lockUntil=timestamp+Options.dtWindowMs/1000,
+            weapon=weaponKey,started=timestamp,expectedShots=expectedShots,
+            lockUntil=expectedShots > 1 and (timestamp+Options.dtWindowMs/1000) or timestamp,
             deadline=timestamp+2,sent=0,members={},results={}}
         Resolver.dt.groups[group.serial]=group
         state.dtLock=group
     end
     group.sent=group.sent+1
     group.members[id], shot.dtGroup = shot, group
-    traceLine(string.format("DT series=%d fire=%d/%d yaw=%.1f pitch=%s",group.serial,group.sent,2,shot.yaw,tostring(shot.pitch)))
+    traceLine(string.format("DT series=%d fire=%d/%d yaw=%.1f pitch=%s",group.serial,group.sent,group.expectedShots or 2,shot.yaw,tostring(shot.pitch)))
 end
 local autoStrategies = {{name = "Adaptive", prior = 0.6}, {name = "Brute-force", prior = 0},
     {name = "Animation", prior = 1}, {name = "Jitter", prior = 1.4}}
@@ -816,13 +844,23 @@ local function update(forceState)
         return
     end
     if activeMode ~= Options.mode then Resolver.clear(); activeMode = Options.mode end
+    local okTeam, curTeam = pcall(function() return localPlayer.Team end)
+    if okTeam then
+        if Resolver._teamInit and curTeam ~= Resolver._lastTeam then Resolver.clear() end
+        Resolver._lastTeam = curTeam
+        Resolver._teamInit = true
+    end
+    local timestamp = now()
     if Options.mode == "Auto DT" then
+        if type(rage) == "table" and type(rage.is_double_tap_charged) == "function" then
+            local okDt, chDt = pcall(rage.is_double_tap_charged)
+            if okDt and chDt then Resolver._lastDtChargedAt = timestamp end
+        end
         for _, group in pairs(Resolver.dt.groups) do Resolver.finishDT(group) end
     end
     local currentTick = globals.tickcount()
     if not forceState and lastUpdateTick == currentTick then return end
     if not forceState then lastUpdateTick = currentTick end
-    local timestamp = now()
     local seen
     if not forceState then seen = {} end
     local activeTarget = not forceState and rememberTarget() or nil
@@ -909,7 +947,7 @@ local function update(forceState)
                                 applyOverride(state, "Override prefer body aim", baim)
                                 local safe = state.saved["Override safe point"]
                                 if safe == nil then safe = "-" end
-                                if Options.safe and (state.phase ~= "tracking" or state.consecutive > 0) then safe = "Force" end
+                                if Options.safe and (state.phase ~= "tracking" or state.consecutive > 0 or (info.is_in_air and not ctx.winner)) then safe = "Force" end
                                 applyOverride(state, "Override safe point", safe)
                             else
                                 restore(state)
@@ -1224,6 +1262,7 @@ local function feedback(event, hit)
         traceLine("result " .. id .. ": previous hypothesis; logged without retraining")
         return
     end
+    local missReason = not hit and type(event.reason) == "string" and string.lower(event.reason:match("^%s*(.-)%s*$") or "") or ""
     if hit then
         Resolver.hits = Resolver.hits + 1
         state.consecutive = 0
@@ -1242,27 +1281,28 @@ local function feedback(event, hit)
                 if math.abs(wrap(failed.offset - shot.offset)) < 2 and samePitch then table.remove(ctx.failedAngles, i) end
             end
         end
-    elseif event.reason == "resolver" then
+    elseif missReason == "resolver" then
         Resolver.misses = Resolver.misses + 1
         state.consecutive = state.consecutive + 1
         ctx.misses = ctx.misses + 1
         if ctx.misses % Options.cycleAfter == 0 then
+            local rejectFor = math.clamp(Options.memory * 0.4, 4, 8)
             ctx.revision = ctx.revision + 1
             if shot.auto then autoFeedback(ctx, shot.strategy, false) end
             local hitbox = event.hitbox or shot.hitbox
             local body = type(hitbox) == "string" and string.lower(hitbox) ~= "head"
-            ctx.failedAngles[#ctx.failedAngles + 1] = {offset = shot.offset, pitch = shot.pitch, body = body, expires = now() + 3}
+            ctx.failedAngles[#ctx.failedAngles + 1] = {offset = shot.offset, pitch = shot.pitch, body = body, expires = now() + rejectFor}
             if #ctx.failedAngles > 32 then table.remove(ctx.failedAngles, 1) end
             if shot.strategy == "Brute-force" then ctx.stage = ctx.stage % 5 + 1 end
             ctx.scores[shot.id] = math.max(-12, (ctx.scores[shot.id] or 0) - 3)
-            ctx.rejected[shot.id] = now() + 3
+            ctx.rejected[shot.id] = now() + rejectFor
             
             ctx.winner = nil
         end
     else
         Resolver.ignored = Resolver.ignored + 1
     end
-    if hit or event.reason == "resolver" then update(state) end
+    if hit or missReason == "resolver" then update(state) end
 end
 function Resolver.status()
     if Resolver.fault then return "API error — see Lua console" end
@@ -1449,10 +1489,31 @@ local function builderUpdate()
         if Builder.owned then Builder.release("disabled") end
         return
     end
+    local okTeam, curTeam = pcall(function() return localPlayer.Team end)
+    if okTeam then
+        if Builder._teamInit and curTeam ~= Builder._lastTeam then
+            if Builder.owned then Builder.release("team or spectator change") end
+        end
+        Builder._lastTeam, Builder._teamInit = curTeam, true
+        if curTeam then
+            local okTn, tn = pcall(function() return curTeam.Name end)
+            if okTn and type(tn) == "string" and string.lower(tn):find("spectat", 1, true) then
+                if Builder.owned then Builder.release("spectator mode") end
+                Builder.pause = "spectator mode"
+                return
+            end
+        end
+    end
     local info = localSnapshot()
-    if not info or not info.is_alive then
-        if Builder.owned then Builder.release("local entity dead or unavailable") end
-        Builder.pause = "local entity dead or unavailable"
+    local inVoid = false
+    pcall(function()
+        local ch = localPlayer.Character
+        local root = ch and (ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("Head"))
+        if root and root.Position and root.Position.Y < -200 then inVoid = true end
+    end)
+    if not info or not info.is_alive or inVoid then
+        if Builder.owned then Builder.release(inVoid and "void kill" or "local entity dead or unavailable") end
+        Builder.pause = inVoid and "void kill" or "local entity dead or unavailable"
         return
     end
     if not Builder.owned then
@@ -1495,11 +1556,16 @@ local function builderUpdate()
         local trigger = (d.trigger == "Manual" and manual) or (d.trigger == "On shot" and shot)
         local charged = false
         if d.trigger == "Charged" or d.shift then
-            requireAPI(rage, "is_double_tap_charged"); charged = rage.is_double_tap_charged()
+            if type(rage) == "table" and type(rage.is_double_tap_charged) == "function" then
+                local okCh, resCh = pcall(rage.is_double_tap_charged)
+                charged = okCh and resCh == true
+            end
         end
         if d.trigger == "Charged" then trigger = charged end
         if trigger and (not d.shift or charged) then
-            if d.shift then requireAPI(rage, "shift_ticks"); rage.shift_ticks(d.shiftTicks) end
+            if d.shift and type(rage) == "table" and type(rage.shift_ticks) == "function" then
+                pcall(rage.shift_ticks, d.shiftTicks)
+            end
             Builder.defense = {untilTick = tick+d.duration, start = tick, config = clone(d)}
         end
     end
@@ -1602,7 +1668,7 @@ do
         MAX_SCAN_NODES = 6000,
         ROLE_ORDER = {dev = 5, staff = 4, vip = 3, beta = 2, free = 1},
         ROLE_TAGS = {dev = "DEV", staff = "MOD", vip = "VIP", beta = "BETA", free = "AR"},
-        SKIP_GUI_HINTS = {"arbadge", "ar_esp", "bubblechat", "experiencechat", "killfeed", "freecam"},
+        SKIP_GUI_HINTS = {"arbadge", "ar_esp", "bubblechat", "experiencechat", "killfeed", "freecam", "shop", "inventory", "mainmenu", "cinematic", "adminpanel"},
         IGNORE_TEXT_ANCESTOR = {"chat", "bubblechat", "experiencechat", "killfeed", "killlog", "elimfeed", "arbadge", "ar_esp", "tooltip"},
         SCOREBOARD_HINTS = {"tab", "score", "board", "player", "roster", "list", "leader", "team"},
         nativeViews = {},
@@ -2424,8 +2490,18 @@ do
                     if okA and resA == false then isAlivePlayer = false end
                 end
                 if isAlivePlayer then
+                    local okTm, tm = pcall(function() return player.Team end)
+                    if okTm and tm then
+                        local okTn, tn = pcall(function() return tm.Name end)
+                        if okTn and type(tn) == "string" and string.lower(tn):find("spectat", 1, true) then
+                            isAlivePlayer = false
+                        end
+                    end
+                end
+                if isAlivePlayer then
                     local headPart, headPos = H.playerHeadPartAndPos(player)
-                    if headPos then
+                    if headPos and headPos.Y > -200
+                        and (math.abs(headPos.X) >= 0.05 or math.abs(headPos.Y) >= 0.05 or math.abs(headPos.Z) >= 0.05) then
                         active[id] = true
                         local usedBillboard = false
                         if asset ~= "" and not S.billboardBroken and playerGui and headPart then
@@ -3012,7 +3088,6 @@ local AdvancedControls = {
     ["Pitch handling"] = true,
     ["Misses before cycling"] = true,
     ["Learning half-life"] = true,
-    ["Safe points on instability"] = true,
     ["Reset learned opponent data"] = true,
     ["Log shot diagnostics"] = true,
     ["Print resolver diagnostics"] = true,
@@ -3134,6 +3209,10 @@ Russian["Delete"] = "Удалить"
 Russian["Import"] = "Импорт"
 Russian["Import code"] = "Код для импорта"
 Russian["Share code"] = "Код для друга"
+Russian["Reveal code"] = "Показать код"
+Russian["Share code revealed"] = "Код показан"
+Russian["Share code copied"] = "Код скопирован"
+Russian["Share code hidden"] = "Код скрыт"
 
 
 
@@ -3329,7 +3408,12 @@ local function prepareProfile()
     sequenceDraft = table.concat(values, ", ")
 end
 element("choice", left, "Always", "Page", function() return page end,
-    function(value) page=value;syncVisibility();Sync.syncNativeWidgets(language, page) end, {"Resolver","AA Builder","Configs","Misc"})
+    function(value)
+        page = value
+        if page ~= "Configs" and shareCode ~= "" then shareCode, shareSelection = "", nil end
+        syncControls()
+        Sync.syncNativeWidgets(language, page)
+    end, {"Resolver","AA Builder","Configs","Misc"})
 element("toggle", right, "Always", "Advanced settings", function() return UISettings.advanced end,
     function(v) saveUISettings(activeLanguage,v);syncVisibility() end)
 
@@ -3479,7 +3563,7 @@ refreshConfigs = function()
         if not nameEdited then nameDraft = selectedSet or "" end
     end
     if shareSelection ~= selectedSet then
-        shareCode = selectedSet and Store.encodeCode(Store.get(selectedSet), selectedSet) or ""
+        shareCode = ""
         shareSelection = selectedSet
     end
     return names
@@ -3499,13 +3583,14 @@ element("text", left, "Configs", "Config name", function() return nameDraft end,
 configButton(left, "Save", function()
     local result, name = Store.save(nameDraft, Settings)
     selectedSet, nameDraft, nameEdited, shareSelection = name, name, false, nil
+    shareCode = ""
     refreshConfigs(); rebuildPicker(); syncControls()
     return result
 end)
 configButton(left, "Load", function()
     assert(selectedSet, "Select one of your saved sets")
     applySettings(Store.use(selectedSet))
-    nameDraft, nameEdited = selectedSet, false
+    nameDraft, nameEdited, shareCode, shareSelection = selectedSet, false, "", selectedSet
     prepareProfile(); syncControls()
     return T("Applied") .. " " .. selectedSet
 end)
@@ -3517,7 +3602,20 @@ configButton(left, "Delete", function()
     refreshConfigs(); rebuildPicker(); syncControls()
     return result
 end)
-element("display", right, "Configs", "Share code", function() return shareCode end)
+configButton(right, "Reveal code", function()
+    if shareCode ~= "" then
+        shareCode = ""
+        syncControls()
+        return T("Share code hidden")
+    end
+    assert(selectedSet, "Select one of your saved sets")
+    shareCode = Store.encodeCode(Store.get(selectedSet), selectedSet)
+    shareSelection = selectedSet
+    local copied = type(setclipboard) == "function" and pcall(setclipboard, shareCode)
+    syncControls()
+    return copied and T("Share code copied") or T("Share code revealed")
+end)
+element("display", right, "Configs", "Share code", function() return shareCode end, nil, nil, function() return shareCode ~= "" end)
 element("text", right, "Configs", "Import code", function() return importDraft end,
     function(v) importDraft = v end)
 configButton(right, "Import", function()
@@ -3532,7 +3630,7 @@ configButton(right, "Import", function()
     local result = Store.save(name, value)
     applySettings(value)
     selectedSet, nameDraft, nameEdited, shareSelection = name, name, false, nil
-    importDraft = ""
+    shareCode, importDraft = "", ""
     refreshConfigs(); rebuildPicker(); prepareProfile(); syncControls()
     return result
 end)
@@ -3771,4 +3869,4 @@ client.set_event_callback("aim_miss",guarded(function(e,hitbox,reason)
     feedback(normalizeEvent("miss",e,hitbox,reason),false)
 end))
 client.set_event_callback("paint",function() Sync.tick(uiStopped); if views[activeLanguage] then views[activeLanguage].paint() end end)
-print("[AR BUILD] " .. BUILD .. " · Beta 1.3.1 · luapi-updated · modules=resolver+builder+configs+sync · schema=2")
+print("[AR BUILD] " .. BUILD .. " · Beta 1.4 · luapi-updated · modules=resolver+builder+configs+sync · schema=2")
