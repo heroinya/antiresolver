@@ -662,16 +662,44 @@ do
 
     local keys = {"Force body yaw value", "Override yaw offset", "Force pitch value", "Override prefer body aim", "Override safe point", "Force pitch", "Force body yaw"}
     local neutral = {0, 0, 0, "-", "-", false, false}
-    local bruteOffsets = {0, 58, -58, 86, -86}
-    local bruteOffsetIds = {"brute1", "brute2", "brute3", "brute4", "brute5"}
-    local extraOffsets = {58, -58, 86, -86}
-    local extraOffsetIds = {"offset58", "offset-58", "offset86", "offset-86"}
+    local bruteOffsets = {0, 58, -58, 86, -86, 35, -35}
+    local bruteOffsetIds = {"brute1", "brute2", "brute3", "brute4", "brute5", "brute6", "brute7"}
+    local extraOffsets = {58, -58, 86, -86, 35, -35}
+    local extraOffsetIds = {"offset58", "offset-58", "offset86", "offset-86", "offset35", "offset-35"}
+    local airOffsetIds = {"air58", "air-58", "air86", "air-86", "air35", "air-35"}
     local autoStrategies = {
         {name = "Adaptive", prior = 0.6},
         {name = "Brute-force", prior = 0},
         {name = "Animation", prior = 1.0},
         {name = "Jitter", prior = 1.4},
     }
+
+    local function isResolverMissReason(r)
+        return r == "resolver" or r == "desync" or r == "aa" or r:find("resolv", 1, true) ~= nil
+    end
+
+    local function readDesyncSignal(player, info, anim, yaw, lby)
+        local signed = nil
+        if anim and finite(anim.desync) and math.abs(anim.desync) >= 5 then
+            signed = anim.desync
+        elseif finite(info.desync_delta) and math.abs(info.desync_delta) >= 5 then
+            signed = info.desync_delta
+        end
+        if not signed and type(entity.get_player_twist_deg) == "function" then
+            local okT, tw = pcall(entity.get_player_twist_deg, player)
+            if okT and finite(tw) and math.abs(tw) >= 5 then signed = tw end
+        end
+        if not signed then
+            local diff = wrap(yaw - lby)
+            if math.abs(diff) >= 8 then signed = diff end
+        end
+        if signed then
+            local mag = math.clamp(math.abs(signed), 15, 86)
+            return signed >= 0 and mag or -mag, mag, true
+        end
+        local fallbackMag = finite(info.desync_delta) and math.clamp(math.abs(info.desync_delta), 25, 86) or 58
+        return fallbackMag, fallbackMag, false
+    end
 
     local states, shots, owners, names = {}, {}, {}, {}
     local playerIdCache, playerIdCacheCount = {}, 0
@@ -812,6 +840,7 @@ do
             medianScratch = {}, medianDirty = true,
             calmTicks = 0, noAa = false, defUntilTick = 0,
             lastBigDelta = nil, lastBigTick = 0, stableChoice = nil,
+            stableRevision = nil, stableContext = nil,
         }
         states[key] = state
         local ok, signal = pcall(function() return player.CharacterAdded end)
@@ -826,7 +855,7 @@ do
                     state.lastRawYaw, state.lastRawPitch, state.lastRevision = nil, nil, nil
                     state.consecutive, state.lastTick = 0, -1
                     state.calmTicks, state.noAa, state.defUntilTick = 0, false, 0
-                    state.stableChoice = nil
+                    state.stableChoice, state.stableRevision, state.stableContext = nil, nil, nil
                 end)
             end)
             if connected and conn then
@@ -854,7 +883,7 @@ do
         local history = state.history
         local values = state.medianScratch
         local n = 0
-        for i = math.max(1, #history - 11), #history do
+        for i = math.max(1, #history - 6), #history do
             n = n + 1
             values[n] = history[i].pitch
         end
@@ -867,23 +896,34 @@ do
     end
 
     local function motion(history)
+        local hLen = #history
+        local startIdx = math.max(1, hLen - 9)
         local sx, sy, flips, changes, lastSign, pmin, pmax = 0, 0, 0, 0, 0, 89, -89
-        for i, rec in ipairs(history) do
-            sx = sx + (rec.yawCos or math.cos(math.rad(rec.yaw)))
-            sy = sy + (rec.yawSin or math.sin(math.rad(rec.yaw)))
+        local stepSum, absStepSum, stepCount, lastDelta = 0, 0, 0, 0
+        for i = startIdx, hLen do
+            local rec = history[i]
+            local w = (i - startIdx + 1)
+            sx = sx + (rec.yawCos or math.cos(math.rad(rec.yaw))) * w
+            sy = sy + (rec.yawSin or math.sin(math.rad(rec.yaw))) * w
             pmin, pmax = math.min(pmin, rec.pitch), math.max(pmax, rec.pitch)
-            if i > 1 then
+            if i > startIdx then
                 local delta = wrap(rec.yaw - history[i - 1].yaw)
-                if math.abs(delta) >= 25 then
+                local ad = math.abs(delta)
+                if ad >= 18 then
                     local sign = delta > 0 and 1 or -1
                     if lastSign ~= 0 and sign ~= lastSign then flips = flips + 1 end
-                    lastSign, changes = sign, changes + 1
+                    lastSign, changes, lastDelta = sign, changes + 1, delta
+                    stepSum, absStepSum, stepCount = stepSum + delta, absStepSum + ad, stepCount + 1
                 end
             end
         end
         local center
         if sx * sx + sy * sy > 0.01 then center = math.deg(math.atan2(sy, sx)) end
-        return flips >= 3 and changes >= 4, center, (pmax - pmin) > 70
+        local jitter = flips >= 2 and changes >= 3
+        local spin = (not jitter) and flips == 0 and stepCount >= 3 and math.abs(stepSum / stepCount) >= 15
+        local avgStep = stepCount > 0 and (stepSum / stepCount) or 0
+        local halfAmp = (jitter and stepCount > 0) and math.min(90, (absStepSum / stepCount) * 0.5) or 0
+        return jitter, center, (pmax - pmin) > 65, spin, avgStep, halfAmp, lastDelta
     end
 
     local function autoFeedback(ctx, strategy, hit)
@@ -932,7 +972,7 @@ do
             if res.hit then
                 hits = hits + 1
                 if res.hitbox == "head" then head = res.shot end
-            elseif rr == "resolver" then
+            elseif isResolverMissReason(rr) then
                 misses = misses + 1
                 if not failed or res.hitbox ~= "head" then failed = res end
             else
@@ -945,18 +985,19 @@ do
             ctx.revision = ctx.revision + 1
             if head then
                 autoFeedback(ctx, head.strategy, true)
-                ctx.scores[head.id] = math.min(6, (ctx.scores[head.id] or 0) + 2)
+                ctx.scores[head.id] = math.min(6, (ctx.scores[head.id] or 0) + 2.5)
                 ctx.rejected[head.id] = nil
                 ctx.winner = {offset = head.offset, pitch = head.pitch, time = ts}
                 for i = #ctx.failedAngles, 1, -1 do
                     local f = ctx.failedAngles[i]
                     local samePitch = f.body or (f.pitch == nil and head.pitch == nil)
-                        or (f.pitch ~= nil and head.pitch ~= nil and math.abs(f.pitch - head.pitch) < 2)
-                    if math.abs(wrap(f.offset - head.offset)) < 2 and samePitch then table.remove(ctx.failedAngles, i) end
+                        or (f.pitch ~= nil and head.pitch ~= nil and math.abs(f.pitch - head.pitch) < 12)
+                    if math.abs(wrap(f.offset - head.offset)) < 14 and samePitch then table.remove(ctx.failedAngles, i) end
                 end
             end
         elseif failed then
             state.consecutive, ctx.misses = state.consecutive + 1, ctx.misses + 1
+            state.defUntilTick = 0
             if ctx.misses % Options.cycleAfter == 0 then
                 local shot = failed.shot
                 local rejectFor = math.clamp(Options.memory * 0.4, 4, 8)
@@ -970,7 +1011,7 @@ do
                 if #ctx.failedAngles > 32 then table.remove(ctx.failedAngles, 1) end
                 ctx.scores[shot.id] = math.max(-12, (ctx.scores[shot.id] or 0) - 3)
                 ctx.rejected[shot.id], ctx.winner = ts + rejectFor, nil
-                if shot.strategy == "Brute-force" then ctx.stage = ctx.stage % 5 + 1 end
+                if shot.strategy == "Brute-force" then ctx.stage = ctx.stage % #bruteOffsets + 1 end
             end
         end
         Resolver.dt.completed = Resolver.dt.completed + 1
@@ -1066,18 +1107,21 @@ do
     local function candidates(state, info, yaw, pitch, lby, curTick)
         local ctx, name = context(state, info)
         local elapsed = nowSafe()
+        local isAir = name == "air"
+        local anchorYaw = isAir and yaw or lby
         if dtActive() then
             local group = state.dtLock
             if group and not group.closed and elapsed < group.lockUntil and group.life == state.life
                 and group.context == name and group.revision == ctx.revision and group.pitchMode == Options.pitch then
-                local jitter, _, pitchJitter = motion(state.history)
-                state.phase = jitter and "jitter" or (pitchJitter and "pitch" or "tracking")
+                local jitter, _, pitchJitter, spin = motion(state.history)
+                state.phase = jitter and "jitter" or (spin and "spin" or (pitchJitter and "pitch" or "tracking"))
                 state.strategy = group.choice.strategy
                 return group.choice
             end
             state.dtLock = nil
         end
-        if Options.defensiveHold and curTick < (state.defUntilTick or 0) and state.stableChoice then
+        if Options.defensiveHold and curTick < (state.defUntilTick or 0) and state.stableChoice
+            and state.stableRevision == ctx.revision and state.stableContext == name then
             state.phase = "defensive"
             state.strategy = state.stableChoice.strategy
             return state.stableChoice
@@ -1093,6 +1137,7 @@ do
             and cache.mode == Options.mode and cache.pitchMode == Options.pitch and cache.memory == Options.memory
             and cache.yaw == yaw and cache.pitch == pitch and cache.lby == lby and cache.delta == info.desync_delta
             and cache.feet == (anim and anim.goal_feet_yaw) and cache.torso == (anim and anim.torso_yaw)
+            and cache.animDesync == (anim and anim.desync)
             and cache.noAa == state.noAa and cache.fakePitch == Options.fakePitch
             and state.choice and state.choice.id == cache.choice.id then
             Resolver.performance.cached = Resolver.performance.cached + 1
@@ -1101,16 +1146,21 @@ do
         end
 
         Resolver.performance.evaluations = Resolver.performance.evaluations + 1
-        local jitter, center, pitchJitter = motion(state.history)
+        local jitter, center, pitchJitter, spin, avgStep, halfAmp, lastDelta = motion(state.history)
+        local signedDelta, absDelta, hasSign = readDesyncSignal(state.player, info, anim, yaw, lby)
+        local hasAaSignal = math.abs(wrap(yaw - lby)) >= 10 or (hasSign and absDelta >= 12)
+            or jitter or spin or pitchJitter or ctx.misses > 0
+        local visualFakePitch = math.abs(pitch) <= 78 and not state.noAa and hasAaSignal
         local suspectFakePitch = Options.fakePitch and Options.pitch == "Auto"
-            and (math.abs(pitch) <= 75 or pitchJitter or ctx.misses > 0)
-        state.phase = jitter and "jitter" or ((pitchJitter or (suspectFakePitch and ctx.misses > 0)) and "pitch" or "tracking")
+            and (visualFakePitch or pitchJitter or ctx.misses >= 2)
+        state.phase = jitter and "jitter" or (spin and "spin"
+            or ((pitchJitter or (visualFakePitch and ctx.misses > 0)) and "pitch" or "tracking"))
         local yaws, pitches = state.yawScratch, state.pitchScratch
         local yawCount, pitchCount = 0, 0
         local function addYaw(id, angle, prior)
             angle = wrap(angle)
             for i = 1, yawCount do
-                if math.abs(wrap(yaws[i].angle - angle)) < 2 then return end
+                if math.abs(wrap(yaws[i].angle - angle)) < 3 then return end
             end
             yawCount = yawCount + 1
             local slot = yaws[yawCount]
@@ -1137,28 +1187,46 @@ do
             addYaw("feet", lby, 3.2)
             state.strategy = "No-AA"
         elseif strategy == "Brute-force" then
-            addYaw(bruteOffsetIds[ctx.stage], lby + bruteOffsets[ctx.stage], 3)
+            addYaw(bruteOffsetIds[ctx.stage], anchorYaw + bruteOffsets[ctx.stage], 3)
         else
+            if ctx.winner then addYaw("learned", anchorYaw + ctx.winner.offset, 4.2) end
+            if spin then addYaw("spin-pred", yaw + avgStep, 3.6) end
             if strategy == "Animation" and anim and finite(anim.goal_feet_yaw) then
-                addYaw("anim-feet", anim.goal_feet_yaw, 4.0)
-                if finite(anim.torso_yaw) then addYaw("anim-torso", anim.torso_yaw, 2.6) end
+                addYaw("anim-feet", anim.goal_feet_yaw, isAir and 2.8 or 3.5)
+                if finite(anim.torso_yaw) then addYaw("anim-torso", anim.torso_yaw, 2.4) end
             end
-            if strategy == "Jitter" and center then addYaw("center", center, 4.0) end
-            addYaw("feet", lby, 3.2)
-            if ctx.winner then addYaw("learned", lby + ctx.winner.offset, 3.6) end
-            if jitter and center then addYaw("center", center, 2.5) end
-            local delta = finite(info.desync_delta) and math.clamp(math.abs(info.desync_delta), 0, 86) or 58
-            addYaw("delta+", lby + delta, 1.8)
-            addYaw("delta-", lby - delta, 1.8)
-            addYaw("visual", yaw, 1.2)
-            for i = 1, 4 do addYaw(extraOffsetIds[i], lby + extraOffsets[i], 1.0) end
+            if jitter and center then
+                if halfAmp >= 35 and lastDelta ~= 0 then
+                    local nextSide = lastDelta > 0 and -halfAmp or halfAmp
+                    addYaw("jit-pred", center + nextSide, strategy == "Jitter" and 3.6 or 2.8)
+                    addYaw("center", center, strategy == "Jitter" and 3.1 or 2.4)
+                    addYaw("jit-alt", center - nextSide, 2.2)
+                else
+                    addYaw("center", center, strategy == "Jitter" and 3.6 or 2.6)
+                end
+            end
+            addYaw("feet", lby, isAir and 2.5 or 3.1)
+            local mirrorYaw = wrap(yaw + wrap(yaw - lby))
+            addYaw("mirror", mirrorYaw, isAir and 2.6 or 2.5)
+            addYaw("delta-s", lby + signedDelta, hasSign and 2.7 or 2.2)
+            addYaw("delta-o", lby - signedDelta, 2.3)
+            addYaw("yaw+d", yaw + signedDelta, isAir and (hasSign and 3.0 or 2.5) or 1.9)
+            addYaw("yaw-d", yaw - signedDelta, isAir and 2.6 or 1.8)
+            addYaw("visual", yaw, isAir and 2.7 or 1.5)
+            local highBoost = (absDelta >= 68 or isAir) and 0.45 or 0
+            for i = 1, #extraOffsets do
+                local off = extraOffsets[i]
+                local pVal = 1.3 + ((math.abs(off) >= 80) and highBoost or 0)
+                addYaw(extraOffsetIds[i], lby + off, pVal)
+                if isAir then addYaw(airOffsetIds[i], yaw + off, pVal + 0.35) end
+            end
         end
 
         local function addPitch(id, angle, prior)
             if angle ~= nil then
                 for i = 1, pitchCount do
                     local pAngle = pitches[i].angle
-                    if pAngle ~= nil and math.abs(pAngle - angle) < 2 then return end
+                    if pAngle ~= nil and math.abs(pAngle - angle) < 4 then return end
                 end
             end
             pitchCount = pitchCount + 1
@@ -1171,15 +1239,22 @@ do
         elseif Options.pitch == "Raw" then
             addPitch("raw", pitch, 1)
         else
-            addPitch("median", medianPitch(state), pitchJitter and 2.0 or 1.4)
-            if ctx.winner and ctx.winner.pitch ~= nil then addPitch("learned", ctx.winner.pitch, 2.2) end
+            if ctx.winner and ctx.winner.pitch ~= nil then addPitch("learned", ctx.winner.pitch, 2.5) end
+            if suspectFakePitch and visualFakePitch and math.abs(pitch) <= 72 then
+                addPitch("fp-down", -89, 2.1)
+            end
+            addPitch("median", medianPitch(state), pitchJitter and 1.9 or 1.5)
             addPitch("raw", pitch, 1.2)
             if suspectFakePitch then
-                addPitch("fp-down", -89, (ctx.misses > 0 and math.abs(pitch) <= 75) and 1.9 or 0.9)
-                addPitch("fp-minus20", clampPitch(pitch - 20), 0.7)
-                addPitch("fp-plus20", clampPitch(pitch + 20), 0.7)
-                addPitch("fp-zero", 0, 0.4)
-                addPitch("fp-up", 89, 0.3)
+                addPitch("fp-down", -89, visualFakePitch and 1.9 or 0.9)
+                addPitch("fp-up", 89, (visualFakePitch or pitchJitter) and 1.35 or 0.25)
+                addPitch("fp-zero", 0, visualFakePitch and 1.0 or 0.20)
+                if visualFakePitch then
+                    addPitch("fp-d70", -70, 0.85)
+                    addPitch("fp-u70", 70, 0.75)
+                    addPitch("fp-m20", clampPitch(pitch - 20), 0.7)
+                    addPitch("fp-p20", clampPitch(pitch + 20), 0.7)
+                end
             end
         end
 
@@ -1191,7 +1266,7 @@ do
         local choiceId = state.choice and state.choice.id
         for yi = 1, yawCount do
             local y = yaws[yi]
-            local yOffset = wrap(y.angle - lby)
+            local yOffset = wrap(y.angle - anchorYaw)
             for pi = 1, pitchCount do
                 local p = pitches[pi]
                 local id = pairId(y.id, p.id)
@@ -1202,8 +1277,8 @@ do
                     for fi = 1, #failedAngles do
                         local failed = failedAngles[fi]
                         local samePitch = failed.body or (failed.pitch == nil and p.angle == nil)
-                            or (failed.pitch ~= nil and p.angle ~= nil and math.abs(failed.pitch - p.angle) < 2)
-                        if samePitch and math.abs(wrap(yOffset - failed.offset)) < 2 then
+                            or (failed.pitch ~= nil and p.angle ~= nil and math.abs(failed.pitch - p.angle) < 12)
+                        if samePitch and math.abs(wrap(yOffset - failed.offset)) < 14 then
                             blocked = true; break
                         end
                     end
@@ -1216,8 +1291,8 @@ do
             end
         end
 
-        local best = {id = bestId, yaw = bestYaw, pitch = bestPitch, context = name, lby = lby, strategy = state.strategy}
-        state.stableChoice = best
+        local best = {id = bestId, yaw = bestYaw, pitch = bestPitch, context = name, lby = lby, anchorYaw = anchorYaw, strategy = state.strategy}
+        state.stableChoice, state.stableRevision, state.stableContext = best, ctx.revision, name
         if (state.staticSamples or 0) >= 16 then
             local expires = math.min(elapsed + 0.2, ctx.decayTime + 1)
             if ctx.winner then expires = math.min(expires, (ctx.winner.time or 0) + Options.memory * 2) end
@@ -1227,7 +1302,7 @@ do
             nextCache.ctx, nextCache.revision, nextCache.stage = ctx, ctx.revision, ctx.stage
             nextCache.mode, nextCache.pitchMode, nextCache.memory = Options.mode, Options.pitch, Options.memory
             nextCache.yaw, nextCache.pitch, nextCache.lby, nextCache.delta = yaw, pitch, lby, info.desync_delta
-            nextCache.feet, nextCache.torso = anim and anim.goal_feet_yaw, anim and anim.torso_yaw
+            nextCache.feet, nextCache.torso, nextCache.animDesync = anim and anim.goal_feet_yaw, anim and anim.torso_yaw, anim and anim.desync
             nextCache.noAa, nextCache.fakePitch = state.noAa, Options.fakePitch
             nextCache.choice, nextCache.phase, nextCache.expires = best, state.phase, expires
             state.candidateCache = nextCache
@@ -1315,10 +1390,13 @@ do
                             local wrappedYaw, samplePitch = wrap(yaw), clampPitch(pitch)
                             if state.lastRawYaw ~= nil then
                                 local step = wrap(wrappedYaw - state.lastRawYaw)
-                                if math.abs(step) > 100 then
+                                local pitchStep = state.lastRawPitch ~= nil and math.abs(samplePitch - state.lastRawPitch) or 0
+                                if pitchStep > 110 then
+                                    state.defUntilTick = currentTick + 6
+                                elseif math.abs(step) > 125 then
                                     if state.lastBigDelta and (step > 0) ~= (state.lastBigDelta > 0)
                                         and (currentTick - state.lastBigTick) <= 6 then
-                                        state.defUntilTick = currentTick + 14
+                                        state.defUntilTick = currentTick + 6
                                         state.lastBigDelta = nil
                                     else
                                         state.lastBigDelta, state.lastBigTick = step, currentTick
@@ -1327,19 +1405,25 @@ do
                             end
                             local ctx, historyContext = context(state, info)
                             local angleChanged = state.lastRawYaw == nil or state.lastRawPitch == nil
-                                or math.abs(wrap(wrappedYaw - state.lastRawYaw)) >= 5
-                                or math.abs(samplePitch - state.lastRawPitch) >= 5
+                                or math.abs(wrap(wrappedYaw - state.lastRawYaw)) >= 2
+                                or math.abs(samplePitch - state.lastRawPitch) >= 2
                             local ctxChanged = state.historyContext ~= historyContext or state.lastRevision ~= ctx.revision
+                            local movingOrAir = info.is_in_air or (finite(info.speed) and info.speed > 5)
                             local due = forceState == state or key == activeKey or state.choice == nil
-                                or angleChanged or ctxChanged or not state.sampleTime or (ts - state.sampleTime > 0.1)
-                                or ((currentTick + state.slotIndex) % 3 == 0)
+                                or angleChanged or ctxChanged or movingOrAir or not state.sampleTime or (ts - state.sampleTime > 0.08)
+                                or ((currentTick + state.slotIndex) % 2 == 0)
                             if due then
                                 local lby = entity.get_player_lby_deg(player)
                                 if finite(lby) then
                                     local wrappedLby = wrap(lby)
                                     local rawDelta = math.abs(wrap(wrappedLby - wrappedYaw))
                                     local dVal = finite(info.desync_delta) and math.abs(info.desync_delta) or 0
-                                    if rawDelta < 8 and dVal < 8 then
+                                    local twVal = 0
+                                    if type(entity.get_player_twist_deg) == "function" then
+                                        local okTw, tw = pcall(entity.get_player_twist_deg, player)
+                                        if okTw and finite(tw) then twVal = math.abs(tw) end
+                                    end
+                                    if rawDelta < 8 and dVal < 8 and twVal < 8 and math.abs(samplePitch) <= 82 then
                                         state.calmTicks = math.min(40, (state.calmTicks or 0) + 1)
                                     else
                                         state.calmTicks = 0
@@ -1347,6 +1431,7 @@ do
                                     state.noAa = state.calmTicks >= 20
 
                                     local inDef = Options.defensiveHold and currentTick < (state.defUntilTick or 0)
+                                        and state.stableRevision == ctx.revision and state.stableContext == historyContext
                                     if not inDef then
                                         if state.historyContext ~= historyContext or (state.sampleTime and ts - state.sampleTime > 0.5) then
                                             state.history = {}
@@ -1395,7 +1480,8 @@ do
                                     if Options.bodyAfter > 0 and state.consecutive >= Options.bodyAfter then baim = "Force" end
                                     applyOverride(state, "Override prefer body aim", baim)
                                     local safe = state.saved["Override safe point"] or "-"
-                                    if Options.safe and (state.phase ~= "tracking" or state.consecutive > 0 or ctx.misses > 0 or (info.is_in_air and not ctx.winner)) then
+                                    if Options.safe and (state.phase ~= "tracking" or state.consecutive > 0 or ctx.misses > 0
+                                        or dVal >= 70 or (info.is_in_air and not ctx.winner)) then
                                         safe = "Force"
                                     end
                                     applyOverride(state, "Override safe point", safe)
@@ -1490,10 +1576,11 @@ do
             shots[oldestID] = nil
         end
         Resolver.trackedShots = Resolver.trackedShots + 1
+        local anchor = choice.anchorYaw or choice.lby
         shots[id] = {
             state = state, character = state.character, life = state.life, time = nowSafe(),
             id = choice.id, context = choice.context, revision = state.contexts[choice.context].revision,
-            offset = wrap(choice.yaw - choice.lby), lby = choice.lby, yaw = choice.yaw, pitch = choice.pitch,
+            offset = wrap(choice.yaw - anchor), lby = choice.lby, anchorYaw = anchor, yaw = choice.yaw, pitch = choice.pitch,
             hitbox = event.hitbox, hitchance = event.hitchance, strategy = choice.strategy,
             auto = Options.mode == "Auto" or Options.mode == "Debug",
         }
@@ -1570,20 +1657,21 @@ do
             ctx.revision = ctx.revision + 1
             if type(event.hitbox) == "string" and string.lower(event.hitbox) == "head" then
                 if shot.auto then autoFeedback(ctx, shot.strategy, true) end
-                ctx.scores[shot.id] = math.min(6, (ctx.scores[shot.id] or 0) + 2)
+                ctx.scores[shot.id] = math.min(6, (ctx.scores[shot.id] or 0) + 2.5)
                 ctx.rejected[shot.id] = nil
                 ctx.winner = {offset = shot.offset, pitch = shot.pitch, time = nowSafe()}
                 for i = #ctx.failedAngles, 1, -1 do
                     local f = ctx.failedAngles[i]
                     local samePitch = f.body or (f.pitch == nil and shot.pitch == nil)
-                        or (f.pitch ~= nil and shot.pitch ~= nil and math.abs(f.pitch - shot.pitch) < 2)
-                    if math.abs(wrap(f.offset - shot.offset)) < 2 and samePitch then table.remove(ctx.failedAngles, i) end
+                        or (f.pitch ~= nil and shot.pitch ~= nil and math.abs(f.pitch - shot.pitch) < 12)
+                    if math.abs(wrap(f.offset - shot.offset)) < 14 and samePitch then table.remove(ctx.failedAngles, i) end
                 end
             end
-        elseif missReason == "resolver" then
+        elseif isResolverMissReason(missReason) then
             Resolver.misses = Resolver.misses + 1
             state.consecutive = state.consecutive + 1
             ctx.misses = ctx.misses + 1
+            state.defUntilTick = 0
             if ctx.misses % Options.cycleAfter == 0 then
                 local rejectFor = math.clamp(Options.memory * 0.4, 4, 8)
                 ctx.revision = ctx.revision + 1
@@ -1595,14 +1683,14 @@ do
                     expires = nowSafe() + rejectFor,
                 }
                 if #ctx.failedAngles > 32 then table.remove(ctx.failedAngles, 1) end
-                if shot.strategy == "Brute-force" then ctx.stage = ctx.stage % 5 + 1 end
+                if shot.strategy == "Brute-force" then ctx.stage = ctx.stage % #bruteOffsets + 1 end
                 ctx.scores[shot.id] = math.max(-12, (ctx.scores[shot.id] or 0) - 3)
                 ctx.rejected[shot.id], ctx.winner = nowSafe() + rejectFor, nil
             end
         else
             Resolver.ignored = Resolver.ignored + 1
         end
-        if hit or missReason == "resolver" then update(state) end
+        if hit or isResolverMissReason(missReason) then update(state) end
     end
 
     function Resolver.tick()
@@ -2128,12 +2216,15 @@ end
 
 -- ==================== SYNC (TAB + 3D ESP) ====================
 do
+    local syncUis = nil
+    pcall(function() syncUis = game:GetService("UserInputService") end)
     local S = {
-        POLL_INTERVAL = 15,
+        POLL_INTERVAL = 14,
         MIN_POLL_GAP = 8.5,
-        SCAN_INTERVAL = 4.0,
-        EMPTY_SCAN_INTERVAL = 6.0,
-        MAX_SCAN_NODES = 1400,
+        PEER_GRACE_SEC = 65,
+        SCAN_INTERVAL = 0.9,
+        EMPTY_SCAN_INTERVAL = 1.2,
+        MAX_SCAN_NODES = 8000,
         ROLE_ORDER = {dev = 5, staff = 4, vip = 3, beta = 2, free = 1},
         ROLE_TAGS = {dev = "DEV", staff = "MOD", vip = "VIP", beta = "BETA", free = "AR"},
         SKIP_GUI_HINTS = {"arbadge", "ar_esp", "ar_textbridge", "bubblechat", "experiencechat", "killfeed", "freecam", "shop", "inventory", "mainmenu", "cinematic", "adminpanel", "antiresolver_skeet"},
@@ -2153,9 +2244,10 @@ do
         failCount = 0,
         lastOkAt = nil,
         storageMode = nil,
-        selfRole = "idle",
+        selfRole = "free",
         statusNote = "Idle",
         peerBadges = {},
+        peerSeenAt = {},
         badgeCount = 0,
         tabCount = 0,
         tabBadges = {},
@@ -2167,8 +2259,21 @@ do
         loggedOnline = false,
         lastAttachSig = "",
         lastTabDown = false,
+        tabPressedSignal = false,
+        tabConn = nil,
         lastHttpErrLog = nil,
     }
+    if syncUis then
+        pcall(function()
+            S.tabConn = syncUis.InputBegan:Connect(function(inp)
+                if inp and inp.KeyCode == Enum.KeyCode.Tab then
+                    S.tabPressedSignal = true
+                    S.nextScanAt = 0
+                    S.nextReposAt = 0
+                end
+            end)
+        end)
+    end
     local H = {}
 
     function H.roleColor(role)
@@ -2344,11 +2449,19 @@ do
         return sz.X, sz.Y, pos.X, pos.Y
     end
 
+    local function isTopStop(p, playerGui)
+        if not p or p == playerGui then return true end
+        local n = H.readNameSafe(p)
+        if n == "PlayerGui" or n == "Players" or n == "CoreGui" or n == "Workspace" then return true end
+        local ok, hit = pcall(function() return p:IsA("PlayerGui") or p:IsA("Player") or p:IsA("DataModel") end)
+        return ok and hit == true
+    end
+
     function H.readRowWidth(node, playerGui)
         local cur, maxW = node, 0
         for _ = 1, 3 do
             local ok, p = pcall(function() return cur.Parent end)
-            if not ok or not p or p == playerGui then break end
+            if not ok or isTopStop(p, playerGui) then break end
             local okS, sz = pcall(function() return p.AbsoluteSize end)
             if okS and sz and sz.X >= 140 and sz.Y >= 12 and sz.Y <= 64 and sz.X > maxW then maxW = sz.X end
             cur = p
@@ -2359,7 +2472,7 @@ do
     function H.shortGuiPath(node, playerGui)
         local parts, cur = {}, node
         for _ = 1, 12 do
-            if not cur or cur == playerGui then break end
+            if isTopStop(cur, playerGui) then break end
             table.insert(parts, 1, H.readNameSafe(cur))
             local ok, p = pcall(function() return cur.Parent end)
             if not ok then break end
@@ -2372,7 +2485,7 @@ do
         local cur, best = node, nil
         for _ = 1, 12 do
             local ok, p = pcall(function() return cur.Parent end)
-            if not ok or not p or p == playerGui then break end
+            if not ok or isTopStop(p, playerGui) then break end
             if H.containsHint(H.readNameSafe(p), S.SCOREBOARD_HINTS) then best = p end
             cur = p
         end
@@ -2383,13 +2496,13 @@ do
         local cur, hasList = node, false
         for step = 1, 10 do
             local ok, p = pcall(function() return cur.Parent end)
-            if not ok or not p or p == playerGui then break end
+            if not ok or isTopStop(p, playerGui) then break end
             local pName = H.readNameSafe(p)
             if H.containsHint(pName, S.IGNORE_TEXT_ANCESTOR) then return false end
             if H.containsHint(pName, S.SCOREBOARD_HINTS) then hasList = true end
             if not hasList and step <= 3 then
                 local okS, sz = pcall(function() return p.AbsoluteSize end)
-                if okS and sz and sz.X >= 160 and sz.Y >= 14 and sz.Y <= 60 then hasList = true end
+                if okS and sz and sz.X >= 100 and sz.Y >= 10 and sz.Y <= 90 then hasList = true end
             end
             if not hasList then
                 local okSf, sf = pcall(function() return p:IsA("ScrollingFrame") end)
@@ -2427,16 +2540,14 @@ do
         if not entry or entry.kind ~= "text" or not entry.gui or not entry.host then return end
         local f, host, bw = entry.gui, entry.host, entry.bw or 16
         local padL = entry.padL or 0
-        local okRead, hostW, tbX, clips, align = pcall(function()
-            local hw = host.AbsoluteSize and host.AbsoluteSize.X or 0
-            local tx = host.TextBounds and host.TextBounds.X or 0
-            local cl = host.ClipsDescendants == true
-            local al = "left"
-            if host.TextXAlignment == Enum.TextXAlignment.Center then al = "center"
-            elseif host.TextXAlignment == Enum.TextXAlignment.Right then al = "right" end
-            return hw, tx, cl, al
+        local hostW, tbX, clips, align = 0, 0, false, "left"
+        pcall(function() if host.AbsoluteSize then hostW = host.AbsoluteSize.X end end)
+        pcall(function() if host.TextBounds then tbX = host.TextBounds.X end end)
+        pcall(function() clips = host.ClipsDescendants == true end)
+        pcall(function()
+            if host.TextXAlignment == Enum.TextXAlignment.Center then align = "center"
+            elseif host.TextXAlignment == Enum.TextXAlignment.Right then align = "right" end
         end)
-        if not okRead then return end
         local ax, ps, px = 0, 0, 0
         if tbX > 0 and align == "left" then
             px = math.floor(padL + tbX + 6)
@@ -2468,39 +2579,40 @@ do
         end
     end
 
+    local function isBadgeAlive(entry)
+        if not entry or not entry.gui or not entry.host or not entry.badgeName then return false end
+        local ok1, p1 = pcall(function() return entry.gui.Parent end)
+        if not ok1 or p1 == nil then return false end
+        local ok2, p2 = pcall(function() return entry.host.Parent end)
+        if not ok2 or p2 == nil then return false end
+        local ok3, found = pcall(function() return entry.host:FindFirstChild(entry.badgeName) end)
+        return ok3 and found ~= nil
+    end
+
     function H.refreshTabBadgePositions()
         for id, entry in pairs(S.tabBadges) do
-            if entry.kind == "text" and entry.gui and entry.host then
-                local okP, par = pcall(function() return entry.gui.Parent end)
-                if okP and par == entry.host then
-                    H.positionTextBadge(entry)
-                else
-                    H.removeTabEntry(id)
-                end
+            if isBadgeAlive(entry) then
+                if entry.kind == "text" then H.positionTextBadge(entry) end
+            else
+                H.removeTabEntry(id)
+                S.nextScanAt = 0
             end
         end
     end
 
-    function H.allWantedAttached(wanted)
-        for id, role in pairs(wanted) do
-            local e = S.tabBadges[id]
-            if not e or not e.gui or not e.host or e.role ~= role then return false end
-            local okP, par = pcall(function() return e.gui.Parent end)
-            if not okP or par ~= e.host then return false end
-        end
-        return true
-    end
-
-    function H.attachTabBadge(id, host, hostKind, role, asset)
+    function H.attachTabBadge(id, host, hostKind, role, asset, score)
         local badgeName = "ARBadge_" .. tostring(id)
         local sig = tostring(role) .. "|" .. tostring(asset) .. "|" .. tostring(hostKind)
         local existing = S.tabBadges[id]
-        if existing and existing.host == host and existing.sig == sig then
-            local okP, par = pcall(function() return existing.gui and existing.gui.Parent end)
-            if okP and par == host then
-                if hostKind == "text" then H.positionTextBadge(existing) end
-                return true
-            end
+        local okSame, sameChild = pcall(function() return host:FindFirstChild(badgeName) end)
+        if existing and existing.sig == sig and okSame and sameChild ~= nil and isBadgeAlive(existing) then
+            if score and score > (existing.score or 0) then existing.score = score end
+            if hostKind == "text" then H.positionTextBadge(existing) end
+            return true
+        end
+        if existing and isBadgeAlive(existing) and (existing.score or 0) > (score or 0) + 80 then
+            if existing.kind == "text" then H.positionTextBadge(existing) end
+            return true
         end
         if existing then H.removeTabEntry(id) end
         pcall(function() local old = host:FindFirstChild(badgeName); if old then old:Destroy() end end)
@@ -2509,8 +2621,8 @@ do
         local bh = asset ~= "" and 16 or 14
 
         local okMake, frame = pcall(function()
-            local zBase = 15
-            pcall(function() if finite(host.ZIndex) then zBase = math.max(15, host.ZIndex + 15) end end)
+            local zBase = 20
+            pcall(function() if finite(host.ZIndex) then zBase = math.max(20, host.ZIndex + 15) end end)
             local color = H.roleColor(role)
             local f = Instance.new("Frame")
             f.Name = badgeName
@@ -2567,7 +2679,11 @@ do
                 local pad = host:FindFirstChildOfClass("UIPadding")
                 if pad and pad.PaddingLeft then padL = pad.PaddingLeft.Offset or 0 end
             end)
-            local entry = {gui = frame, host = host, sig = sig, kind = hostKind, role = role, bw = bw, padL = padL, conns = {}}
+            local entry = {
+                gui = frame, host = host, badgeName = badgeName, sig = sig,
+                kind = hostKind, role = role, bw = bw, padL = padL,
+                score = score or 0, conns = {},
+            }
             if hostKind == "text" then
                 H.positionTextBadge(entry)
                 local function repos() H.positionTextBadge(entry) end
@@ -2602,16 +2718,63 @@ do
         return byAvatarId, byName
     end
 
-    function H.scanRootForHosts(root, playerGui, byAvatarId, byName)
+    local function isWordByte(b)
+        if not b then return false end
+        return (b >= 48 and b <= 57) or (b >= 97 and b <= 122) or b == 95
+    end
+
+    function H.matchTextToPlayer(txt, byName)
+        if type(txt) ~= "string" or #txt == 0 or #txt > 512 then return nil end
+        local plainTight = txt:gsub("<[^>]+>", "")
+        if #plainTight == 0 or #plainTight > 110 then return nil end
+        local clean = string.lower(trimStr(plainTight)):gsub("^@", "")
+        if clean == "" then return nil end
+        local id = byName[clean]
+        if id then return id end
+        local plainSpaced = txt:gsub("<[^>]+>", " "):gsub("%s+", " ")
+        local cleanSp = string.lower(trimStr(plainSpaced)):gsub("^@", "")
+        local stripped = trimStr(cleanSp:gsub("^%[[^%]]+%]%s*", ""):gsub("%s*%[[^%]]+%]$", ""):gsub("%s*%(you%)$", ""))
+        if stripped == "" then return nil end
+        id = byName[stripped]
+        if id then return id end
+        if stripped:find("killed", 1, true) or stripped:find("joined", 1, true) or stripped:find("left the", 1, true) then
+            return nil
+        end
+        local sLen = #stripped
+        for nm, uid in pairs(byName) do
+            local nLen = #nm
+            if nLen >= 2 and sLen >= nLen and sLen <= nLen + 40 then
+                local sPos, ePos = stripped:find(nm, 1, true)
+                if sPos then
+                    local beforeB = sPos > 1 and string.byte(stripped, sPos - 1) or nil
+                    local afterB = ePos < sLen and string.byte(stripped, ePos + 1) or nil
+                    if (not isWordByte(beforeB) and not isWordByte(afterB))
+                        or (nLen >= 4 and ePos == sLen) then
+                        return uid
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    function H.scanRootForHosts(root, playerGui, byAvatarId, byName, includeHidden)
         local scoredHosts = {}
-        if H.shouldSkipNode(root) or not H.isBranchVisible(root) then return scoredHosts end
+        if H.shouldSkipNode(root) or (not includeHidden and not H.isBranchVisible(root)) then return scoredHosts end
         local queue, head, visited = {root}, 1, 0
         local function recordCandidate(id, node, kind, bonus)
-            local w, h, px, py = H.readNodeRect(node)
-            if not w then return end
+            local w, h, px, py
+            if includeHidden then
+                local okS, sz = pcall(function() return node.AbsoluteSize end)
+                w, h, px, py = (okS and sz and sz.X or 16), (okS and sz and sz.Y or 16), 0, 100
+            else
+                w, h, px, py = H.readNodeRect(node)
+                if not w then return end
+            end
+            if kind == "avatar" and not includeHidden and py < 65 then return end
             local sb = H.findAncestorScoreboard(node, playerGui)
             local rowW = H.readRowWidth(node, playerGui)
-            local score = (sb and 200 or 0) + (rowW >= 160 and 120 or 20) + bonus
+            local score = (sb and 200 or 0) + (rowW >= 140 and 120 or 20) + bonus
             if kind == "avatar" and py >= 65 and h >= 14 then score = score + 30 end
             local cur = scoredHosts[id]
             if not cur or score > cur.score then
@@ -2621,8 +2784,7 @@ do
         while head <= #queue and visited < S.MAX_SCAN_NODES do
             local node = queue[head]
             head, visited = head + 1, visited + 1
-            if visited % 200 == 0 and type(task) == "table" and type(task.wait) == "function" then task.wait() end
-            if not H.shouldSkipNode(node) and H.isBranchVisible(node) then
+            if not H.shouldSkipNode(node) and (includeHidden or H.isBranchVisible(node)) then
                 local okImg, isImg = pcall(function() return node:IsA("ImageLabel") or node:IsA("ImageButton") end)
                 if okImg and isImg then
                     local okSrc, src = pcall(function() return node.Image end)
@@ -2635,28 +2797,8 @@ do
                     local okTxt, isTxt = pcall(function() return node:IsA("TextLabel") or node:IsA("TextButton") end)
                     if okTxt and isTxt then
                         local okVal, txt = pcall(function() return node.Text end)
-                        if okVal and type(txt) == "string" and #txt > 0 and #txt <= 96 then
-                            local plain = txt:gsub("<[^>]+>", "")
-                            local clean = string.lower(trimStr(plain)):gsub("^@", "")
-                            local id = byName[clean]
-                            if not id then
-                                local stripped = trimStr(clean:gsub("^%[[^%]]+%]%s*", ""):gsub("%s*%[[^%]]+%]$", ""):gsub("%s*%(you%)$", ""))
-                                id = byName[stripped]
-                                if not id and #stripped > 0 and not stripped:find("killed", 1, true) and not stripped:find("joined", 1, true) then
-                                    for nm, uid in pairs(byName) do
-                                        local nLen = #nm
-                                        if nLen >= 2 and #stripped > nLen and #stripped - nLen <= 34 then
-                                            if stripped:sub(-nLen) == nm then
-                                                local sep = stripped:sub(#stripped - nLen, #stripped - nLen)
-                                                if sep == " " or sep == "]" or sep == "|" or sep == ":" or sep == "-" then
-                                                    id = uid
-                                                    break
-                                                end
-                                            end
-                                        end
-                                    end
-                                end
-                            end
+                        if okVal then
+                            local id = H.matchTextToPlayer(txt, byName)
                             if id and H.isLikelyRowTextNode(node, playerGui) then recordCandidate(id, node, "text", 80) end
                         end
                     end
@@ -2664,7 +2806,9 @@ do
                 local okCh, children = pcall(function() return node:GetChildren() end)
                 if okCh and type(children) == "table" then
                     for _, ch in ipairs(children) do
-                        if not H.shouldSkipNode(ch) and H.isBranchVisible(ch) then queue[#queue + 1] = ch end
+                        if not H.shouldSkipNode(ch) and (includeHidden or H.isBranchVisible(ch)) then
+                            queue[#queue + 1] = ch
+                        end
                     end
                 end
             end
@@ -2685,67 +2829,65 @@ do
         S.scanRunning = true
         local asset = H.effectiveAsset()
         local function work()
-            if gen ~= S.gen or not alive then S.scanRunning = false; return end
-            if H.allWantedAttached(wanted) then
-                S.nextScanAt = nowSafe() + S.SCAN_INTERVAL
-                S.scanRunning = false
-                return
-            end
-            local byAvatarId, byName = H.buildMatchIndexes(wanted, meta)
-            local roots, secondary = {}, {}
-            local okCh, topList = pcall(function() return playerGui:GetChildren() end)
-            if okCh and type(topList) == "table" then
-                for _, gui in ipairs(topList) do
-                    if not H.shouldSkipNode(gui) and H.isBranchVisible(gui) then
-                        if H.containsHint(H.readNameSafe(gui), S.SCOREBOARD_HINTS) then roots[#roots + 1] = gui
-                        else secondary[#secondary + 1] = gui end
+            local okW, errW = pcall(function()
+                if gen ~= S.gen or not alive then return end
+                local byAvatarId, byName = H.buildMatchIndexes(wanted, meta)
+                local roots, secondary = {}, {}
+                local okCh, topList = pcall(function() return playerGui:GetChildren() end)
+                if okCh and type(topList) == "table" then
+                    for _, gui in ipairs(topList) do
+                        if not H.shouldSkipNode(gui) and H.isBranchVisible(gui) then
+                            if H.containsHint(H.readNameSafe(gui), S.SCOREBOARD_HINTS) then roots[#roots + 1] = gui
+                            else secondary[#secondary + 1] = gui end
+                        end
                     end
+                    for _, gui in ipairs(secondary) do roots[#roots + 1] = gui end
                 end
-            end
-            local bestById, foundCount = {}, 0
-            local function runPass(list)
-                for _, root in ipairs(list) do
-                    if gen ~= S.gen or not alive or foundCount >= wantCount then break end
-                    local scored = H.scanRootForHosts(root, playerGui, byAvatarId, byName)
+                local bestById = {}
+                for _, root in ipairs(roots) do
+                    if gen ~= S.gen or not alive then break end
+                    local scored = H.scanRootForHosts(root, playerGui, byAvatarId, byName, false)
                     for k, cand in pairs(scored) do
                         local prev = bestById[k]
-                        if not prev then foundCount = foundCount + 1 end
                         if not prev or cand.score > prev.score then bestById[k] = cand end
                     end
-                    if type(task) == "table" and type(task.wait) == "function" then task.wait() end
                 end
-            end
-            runPass(roots)
-            if foundCount < wantCount then runPass(secondary) end
-            if gen == S.gen and alive then
-                local attachedAny, sample = false, nil
-                for id, role in pairs(wanted) do
-                    local cand = bestById[id]
-                    if cand then
-                        if H.attachTabBadge(id, cand.node, cand.kind, role, asset) then
-                            attachedAny = true
-                            if not sample or cand.score > sample.score then sample = cand end
+                if gen == S.gen and alive then
+                    local attachedAny, sample = false, nil
+                    for id, role in pairs(wanted) do
+                        local cand = bestById[id]
+                        if cand then
+                            if H.attachTabBadge(id, cand.node, cand.kind, role, asset, cand.score) then
+                                attachedAny = true
+                                if not sample or cand.score > sample.score then sample = cand end
+                            end
+                        else
+                            local cur = S.tabBadges[id]
+                            if cur then
+                                if isBadgeAlive(cur) then
+                                    attachedAny = true
+                                else
+                                    H.removeTabEntry(id)
+                                end
+                            end
                         end
-                    else
-                        H.removeTabEntry(id)
                     end
-                end
-                if attachedAny and sample then
-                    local path = H.shortGuiPath(sample.node, playerGui)
-                    local sig = tostring(S.tabCount) .. "|" .. path .. "|" .. tostring(sample.kind)
-                    if sig ~= S.lastAttachSig then
-                        S.lastAttachSig = sig
-                        print(string.format("[AR Sync] attached Tab badges: count=%d sample=%s (%s %.0fx%.0f @ %.0f,%.0f)",
-                            S.tabCount, path, tostring(sample.kind), sample.w, sample.h, sample.x, sample.y))
+                    if attachedAny and sample then
+                        local path = H.shortGuiPath(sample.node, playerGui)
+                        local sig = tostring(S.tabCount) .. "|" .. path .. "|" .. tostring(sample.kind)
+                        if sig ~= S.lastAttachSig then
+                            S.lastAttachSig = sig
+                            print(string.format("[AR Sync] attached Tab badges: count=%d sample=%s (%s %.0fx%.0f @ %.0f,%.0f)",
+                                S.tabCount, path, tostring(sample.kind), sample.w, sample.h, sample.x, sample.y))
+                        end
                     end
-                else
-                    S.lastAttachSig = ""
+                    S.nextScanAt = nowSafe() + (attachedAny and S.SCAN_INTERVAL or S.EMPTY_SCAN_INTERVAL)
                 end
-                S.nextScanAt = nowSafe() + (attachedAny and S.SCAN_INTERVAL or S.EMPTY_SCAN_INTERVAL)
-            end
+            end)
+            if not okW then warn("[AR Sync] scan error: " .. tostring(errW)) end
             S.scanRunning = false
         end
-        if type(task) == "table" and type(task.spawn) == "function" then task.spawn(work) else pcall(work); S.scanRunning = false end
+        if type(task) == "table" and type(task.spawn) == "function" then task.spawn(work) else work() end
     end
 
     function H.startHttpPoll(reqFn)
@@ -2775,7 +2917,7 @@ do
             local code = tonumber(resp.StatusCode or resp.status_code or resp.Status or resp.status) or 0
             local rawBody = resp.Body or resp.body or ""
             if code == 429 then
-                S.failCount = S.failCount + 1; S.statusNote = "Rate limited"; S.nextPollAt = t + 25; return
+                S.failCount = S.failCount + 1; S.statusNote = "Rate limited"; S.nextPollAt = t + 9.0; return
             elseif code < 200 or code >= 300 then
                 S.failCount = S.failCount + 1
                 S.statusNote = "HTTP " .. tostring(code)
@@ -2795,32 +2937,115 @@ do
                 S.loggedOnline = true
                 print(string.format("[AR Sync] online role=%s storage=%s peers=%d", tostring(S.selfRole), tostring(S.storageMode), #peerIds))
             end
+            local _, _, curById = H.collectPlayers()
             local nextMap, nextCount = {}, 0
             if type(data.badges) == "table" then
                 for idKey, roleVal in pairs(data.badges) do
                     local idNum = tonumber(idKey)
-                    if idNum and S.ROLE_ORDER[roleVal] then nextMap[idNum] = roleVal; nextCount = nextCount + 1 end
+                    if idNum and S.ROLE_ORDER[roleVal] then
+                        nextMap[idNum] = roleVal
+                        S.peerSeenAt[idNum] = t
+                        nextCount = nextCount + 1
+                    end
+                end
+            end
+            for idPrev, rolePrev in pairs(S.peerBadges) do
+                if not nextMap[idPrev] then
+                    local seen = S.peerSeenAt[idPrev] or 0
+                    if curById[idPrev] and (t - seen) <= S.PEER_GRACE_SEC then
+                        nextMap[idPrev] = rolePrev
+                        nextCount = nextCount + 1
+                    else
+                        S.peerSeenAt[idPrev] = nil
+                    end
                 end
             end
             S.peerBadges, S.badgeCount = nextMap, nextCount
+            S.espPlayersAt = 0
             S.nextPollAt = t + S.POLL_INTERVAL + math.random(0, 3)
             S.nextScanAt = 0
         end
         if type(task) == "table" and type(task.spawn) == "function" then task.spawn(doRequest) else pcall(doRequest); S.inFlight = false end
     end
 
+    local function validWorldPos(v)
+        if not v then return false end
+        local ok, x, y, z = pcall(function() return v.X, v.Y, v.Z end)
+        if not ok or not finite(x) or not finite(y) or not finite(z) then return false end
+        if y <= -200 then return false end
+        return math.abs(x) >= 0.05 or math.abs(y) >= 0.05 or math.abs(z) >= 0.05
+    end
+
     function H.worldToScreenSafe(pos)
         if type(render) == "table" and type(render.world_to_screen) == "function" then
             local ok, x, y, vis = pcall(render.world_to_screen, pos)
-            if ok and finite(x) and finite(y) then return x, y, vis == true end
+            if ok and vis == true and finite(x) and finite(y) then return x, y, true end
         end
-        local okCam, vec, onScreen = pcall(function()
+        local okCam, vec, onScreen, sw, sh = pcall(function()
             local cam = workspace and workspace.CurrentCamera
-            if not cam then return nil, false end
-            return cam:WorldToViewportPoint(pos)
+            if not cam then return nil, false, 1920, 1080 end
+            local v, on = cam:WorldToViewportPoint(pos)
+            local vp = cam.ViewportSize
+            return v, on, vp and vp.X or 1920, vp and vp.Y or 1080
         end)
-        if okCam and vec and onScreen and finite(vec.Z) and vec.Z > 0 then return vec.X, vec.Y, true end
+        if okCam and vec and finite(vec.X) and finite(vec.Y) and finite(vec.Z) and vec.Z > 0.1 then
+            if onScreen or (vec.X >= -40 and vec.X <= sw + 40 and vec.Y >= -40 and vec.Y <= sh + 40) then
+                return vec.X, vec.Y, true
+            end
+        end
         return nil, nil, false
+    end
+
+    function H.resolvePeerHeadPos(player)
+        if type(entity) == "table" and type(entity.get_player_hitbox_position) == "function" then
+            local okP, v = pcall(entity.get_player_hitbox_position, player, "head")
+            if okP and validWorldPos(v) then return v end
+            local okC, vc = pcall(entity.get_player_hitbox_position, player, "chest")
+            if okC and validWorldPos(vc) then return vc + Vector3.new(0, 1.2, 0) end
+        end
+        local charPos = nil
+        pcall(function()
+            local ch = player.Character
+            if not ch then return end
+            local hp = ch:FindFirstChild("Head")
+            if hp and validWorldPos(hp.Position) then charPos = hp.Position; return end
+            local hrp = ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("UpperTorso") or ch:FindFirstChild("Torso")
+            if hrp and validWorldPos(hrp.Position) then charPos = hrp.Position + Vector3.new(0, 2.2, 0) end
+        end)
+        if charPos then return charPos end
+        if type(entity) == "table" and type(entity.get_player_position) == "function" then
+            local okE, v = pcall(entity.get_player_position, player)
+            if okE and validWorldPos(v) then return v + Vector3.new(0, 2.2, 0) end
+        end
+        return nil
+    end
+
+    function H.isPeerAliveForEsp(player)
+        local isSpec = false
+        pcall(function()
+            local tm = player.Team
+            if tm and type(tm.Name) == "string" and string.lower(tm.Name):find("spectat", 1, true) then isSpec = true end
+        end)
+        if isSpec then return false end
+        local humAlive = nil
+        pcall(function()
+            local ch = player.Character
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            if hum and finite(hum.Health) then humAlive = hum.Health > 0 end
+        end)
+        local entHp = nil
+        if type(entity) == "table" and type(entity.get_player_health) == "function" then
+            local okH, hp = pcall(entity.get_player_health, player)
+            if okH and finite(hp) then entHp = hp end
+        end
+        if humAlive == true or (entHp and entHp > 0) then return true end
+        if humAlive == false and (not entHp or entHp <= 0) then return false end
+        if entHp ~= nil and entHp <= 0 then return false end
+        if type(entity) == "table" and type(entity.is_alive) == "function" then
+            local okA, resA = pcall(entity.is_alive, player)
+            if okA and resA == false then return false end
+        end
+        return true
     end
 
     function H.updateEsp(nowT)
@@ -2830,7 +3055,7 @@ do
             return
         end
         if nowT >= S.espPlayersAt then
-            S.espPlayersAt = nowT + 1.0
+            S.espPlayersAt = nowT + 0.75
             local myId, _, byId = H.collectPlayers()
             S.espMyId, S.espById = myId, byId
         end
@@ -2839,68 +3064,54 @@ do
         for k in pairs(active) do active[k] = nil end
         for id, role in pairs(S.peerBadges) do
             local player = byId[id]
-            if id ~= myId and player then
-                local okAlive = true
-                if type(entity.is_alive) == "function" then
-                    local okA, resA = pcall(entity.is_alive, player)
-                    if okA and resA == false then okAlive = false end
-                end
-                if okAlive then
-                    local okTm, tm = pcall(function() return player.Team end)
-                    if okTm and tm then
-                        local okTn, tn = pcall(function() return tm.Name end)
-                        if okTn and type(tn) == "string" and string.lower(tn):find("spectat", 1, true) then okAlive = false end
+            if id ~= myId and player and H.isPeerAliveForEsp(player) then
+                local headPos = H.resolvePeerHeadPos(player)
+                if headPos then
+                    active[id] = true
+                    local sx, sy, onScreen = H.worldToScreenSafe(headPos + Vector3.new(0, 1.4, 0))
+                    local lbl = S.espDrawings[id]
+                    if not lbl and type(Drawing) == "table" and type(Drawing.new) == "function" then
+                        local okD, obj = pcall(Drawing.new, "Text")
+                        if okD and obj then
+                            pcall(function() obj.Size = 13; obj.Center = true; obj.Outline = true; obj.Transparency = 1; obj.ZIndex = 45 end)
+                            S.espDrawings[id] = obj; lbl = obj
+                        end
                     end
-                end
-                if okAlive then
-                    local headPos = nil
-                    if type(entity.get_player_hitbox_position) == "function" then
-                        local okP, v = pcall(entity.get_player_hitbox_position, player, "head")
-                        if okP and v then headPos = v end
-                    end
-                    if not headPos then
+                    if lbl then
                         pcall(function()
-                            local hp = player.Character and player.Character:FindFirstChild("Head")
-                            if hp then headPos = hp.Position end
-                        end)
-                    end
-                    if headPos and headPos.Y > -200
-                        and (math.abs(headPos.X) >= 0.05 or math.abs(headPos.Y) >= 0.05 or math.abs(headPos.Z) >= 0.05) then
-                        active[id] = true
-                        local sx, sy, onScreen = H.worldToScreenSafe(headPos + Vector3.new(0, 1.35, 0))
-                        local lbl = S.espDrawings[id]
-                        if not lbl and type(Drawing) == "table" and type(Drawing.new) == "function" then
-                            local okD, obj = pcall(Drawing.new, "Text")
-                            if okD and obj then
-                                pcall(function() obj.Size = 13; obj.Center = true; obj.Outline = true end)
-                                S.espDrawings[id] = obj; lbl = obj
+                            if onScreen and sx and sy then
+                                local tag = "[" .. (S.ROLE_TAGS[role] or "AR") .. "]"
+                                if lbl.Text ~= tag then lbl.Text = tag end
+                                lbl.Color = H.roleColor(role)
+                                lbl.Transparency = 1
+                                lbl.Position = Vector2.new(math.floor(sx + 0.5), math.floor(sy - 14 + 0.5))
+                                lbl.Visible = true
+                            else
+                                lbl.Visible = false
                             end
-                        end
-                        if lbl then
-                            pcall(function()
-                                if onScreen and sx and sy then
-                                    lbl.Text = "[" .. (S.ROLE_TAGS[role] or "AR") .. "]"
-                                    lbl.Color = H.roleColor(role)
-                                    lbl.Position = Vector2.new(sx, sy - 14)
-                                    lbl.Visible = true
-                                else
-                                    lbl.Visible = false
-                                end
-                            end)
-                        end
+                        end)
                     end
                 end
             end
         end
         for id, obj in pairs(S.espDrawings) do
-            if not active[id] then H.destroyDraw(obj); S.espDrawings[id] = nil end
+            if not S.peerBadges[id] then
+                H.destroyDraw(obj)
+                S.espDrawings[id] = nil
+            elseif not active[id] then
+                pcall(function() obj.Visible = false end)
+            end
         end
     end
 
     local function isTabKeyDown()
         if type(input) == "table" and type(input.is_key_down) == "function" then
             local ok, d = pcall(input.is_key_down, "Tab")
-            return ok and d == true
+            if ok and d == true then return true end
+        end
+        if syncUis then
+            local ok2, d2 = pcall(function() return syncUis:IsKeyDown(Enum.KeyCode.Tab) end)
+            if ok2 and d2 == true then return true end
         end
         return false
     end
@@ -2921,12 +3132,37 @@ do
         local cfg = H.syncCfg()
         S.lastAttachSig = ""
         if not cfg.enabled then
-            S.peerBadges, S.badgeCount = {}, 0
+            S.peerBadges, S.peerSeenAt, S.badgeCount = {}, {}, 0
             S.statusNote = "Disabled"
             H.clearTabBadges(); H.clearEsp()
         else
             S.nextPollAt, S.nextScanAt = 0, 0
         end
+    end
+
+    function Sync.diagnose()
+        local playerGui = H.getPlayerGui()
+        local myId, _, _, meta = H.collectPlayers()
+        local wanted, wantCount = H.wantedMap(myId)
+        print(string.format("[AR Sync DIAG] status=%s role=%s wanted=%d peers=%d tab=%d lastAttach=%s",
+            tostring(S.statusNote), tostring(S.selfRole), wantCount, S.badgeCount, S.tabCount, tostring(S.lastAttachSig)))
+        if not playerGui then print("[AR Sync DIAG] PlayerGui=nil"); return end
+        local topNames = {}
+        local byAvatarId, byName = H.buildMatchIndexes(wanted, meta)
+        local okCh, topList = pcall(function() return playerGui:GetChildren() end)
+        if okCh and type(topList) == "table" then
+            for _, gui in ipairs(topList) do
+                topNames[#topNames + 1] = H.readNameSafe(gui) .. (H.isBranchVisible(gui) and "(vis)" or "(hid)")
+                if not H.shouldSkipNode(gui) then
+                    local scored = H.scanRootForHosts(gui, playerGui, byAvatarId, byName, true)
+                    for uid, cand in pairs(scored) do
+                        print(string.format("[AR Sync DIAG] match id=%s kind=%s score=%d inSb=%s path=%s",
+                            tostring(uid), tostring(cand.kind), cand.score, tostring(cand.inSb), H.shortGuiPath(cand.node, playerGui)))
+                    end
+                end
+            end
+        end
+        print("[AR Sync DIAG] PlayerGui: " .. table.concat(topNames, ", "))
     end
 
     function Sync.tick(stopped)
@@ -2938,22 +3174,22 @@ do
         if reqFn and not S.inFlight and t >= S.nextPollAt and (t - (S.lastAttemptAt or 0)) >= S.MIN_POLL_GAP then
             H.startHttpPoll(reqFn)
         end
-        local tabDown = isTabKeyDown()
+        local tabDown = isTabKeyDown() or S.tabPressedSignal
+        S.tabPressedSignal = false
+        local tabInterval = S.tabCount == 0 and 0.20 or 0.45
         if tabDown and not S.lastTabDown then
-            S.nextScanAt = math.min(S.nextScanAt, t + 0.04)
+            S.nextScanAt = math.min(S.nextScanAt, t + 0.02)
             S.nextReposAt = 0
+        elseif tabDown and S.nextScanAt > t + tabInterval then
+            S.nextScanAt = t + tabInterval
         end
         S.lastTabDown = tabDown
         if not S.scanRunning and t >= S.nextScanAt then
-            if tabDown or S.tabCount == 0 then
-                S.nextScanAt = t + (tabDown and 0.8 or S.SCAN_INTERVAL)
-                H.startTabScan(S.gen)
-            else
-                S.nextScanAt = t + S.SCAN_INTERVAL
-            end
+            S.nextScanAt = t + (tabDown and tabInterval or S.SCAN_INTERVAL)
+            H.startTabScan(S.gen)
         end
         if tabDown and S.tabCount > 0 and t >= S.nextReposAt then
-            S.nextReposAt = t + 0.12
+            S.nextReposAt = t + 0.06
             H.refreshTabBadgePositions()
         end
         H.updateEsp(t)
@@ -2962,6 +3198,8 @@ do
     function Sync.stop()
         S.gen = S.gen + 1
         S.inFlight, S.scanRunning = false, false
+        S.peerSeenAt = {}
+        if S.tabConn then pcall(function() S.tabConn:Disconnect() end); S.tabConn = nil end
         H.clearTabBadges(); H.clearEsp()
     end
 end
@@ -3055,10 +3293,11 @@ do
     end
 end
 
--- ==================== STANDALONE SKEET UI ENGINE (PURE GAMESENSE / LOW-CPU DRAWING.NEW) ====================
+-- ==================== STANDALONE SKEET UI ENGINE (AUTHENTIC SKEET.LUA SCREENGUI + INPUT.* ENGINE) ====================
 local SkeetUI = {}
 do
     local players = game:GetService("Players")
+    local hs = game:GetService("HttpService")
     local uis = nil
     pcall(function() uis = game:GetService("UserInputService") end)
 
@@ -3071,44 +3310,18 @@ do
     }
     SkeetUI.ACCENTS = ACCENTS
 
-    local BG_BLACK      = Color3.fromRGB(12, 12, 12)
-    local BG_PURE_BLK   = Color3.fromRGB(0, 0, 0)
-    local BG_SHADOW     = Color3.fromRGB(6, 6, 6)
-    local BG_BEVEL_OUT  = Color3.fromRGB(60, 60, 60)
-    local BG_BEVEL_MID  = Color3.fromRGB(40, 40, 40)
-    local BG_MAIN       = Color3.fromRGB(20, 20, 20)
-    local BG_SIDE       = Color3.fromRGB(12, 12, 12)
+    local BG_DARK       = Color3.fromRGB(12, 12, 12)
     local BG_PANEL      = Color3.fromRGB(23, 23, 23)
     local BG_CTRL       = Color3.fromRGB(30, 30, 30)
     local BG_CTRL_HOV   = Color3.fromRGB(38, 38, 38)
-    local BG_CTRL_ACT   = Color3.fromRGB(48, 48, 48)
-    local BG_INPUT      = Color3.fromRGB(24, 24, 24)
+    local BG_CTRL_ACT   = Color3.fromRGB(50, 50, 50)
     local BG_POPUP      = Color3.fromRGB(26, 26, 26)
-    local BG_TRACK      = Color3.fromRGB(34, 34, 34)
     local BORDER_LIGHT  = Color3.fromRGB(40, 40, 40)
-    local BORDER_HOV    = Color3.fromRGB(54, 54, 54)
-    local SCROLL_TRACK  = Color3.fromRGB(16, 16, 16)
-    local SCROLL_THUMB  = Color3.fromRGB(58, 58, 58)
-    local CHECK_OFF     = Color3.fromRGB(42, 42, 42)
-    local CHECK_HOV     = Color3.fromRGB(56, 56, 56)
     local TEXT_NORM     = Color3.fromRGB(198, 198, 198)
-    local TEXT_BRIGHT   = Color3.fromRGB(236, 236, 236)
-    local TEXT_DIM      = Color3.fromRGB(126, 126, 126)
+    local TEXT_BRIGHT   = Color3.fromRGB(238, 238, 238)
     local TAB_IDLE      = Color3.fromRGB(109, 109, 109)
     local TAB_HOV       = Color3.fromRGB(204, 204, 204)
     local TAB_ACT       = Color3.fromRGB(255, 255, 255)
-
-    local RB_CYAN       = Color3.fromRGB(55, 177, 218)
-    local RB_MAGENTA    = Color3.fromRGB(201, 70, 176)
-    local RB_LIME       = Color3.fromRGB(204, 227, 53)
-    local RB_FALLBACK   = {
-        Color3.fromRGB(55, 177, 218),
-        Color3.fromRGB(128, 118, 206),
-        Color3.fromRGB(201, 70, 176),
-        Color3.fromRGB(204, 132, 128),
-        Color3.fromRGB(204, 186, 86),
-        Color3.fromRGB(204, 227, 53),
-    }
 
     local CAPTURE_KEYS = {
         "RightShift", "LeftShift", "Insert", "Delete", "Home", "End", "PageUp", "PageDown",
@@ -3122,122 +3335,8 @@ do
         "Escape",
     }
 
-    local TYPE_MAP = {
-        A = {"a", "A"}, B = {"b", "B"}, C = {"c", "C"}, D = {"d", "D"}, E = {"e", "E"},
-        F = {"f", "F"}, G = {"g", "G"}, H = {"h", "H"}, I = {"i", "I"}, J = {"j", "J"},
-        K = {"k", "K"}, L = {"l", "L"}, M = {"m", "M"}, N = {"n", "N"}, O = {"o", "O"},
-        P = {"p", "P"}, Q = {"q", "Q"}, R = {"r", "R"}, S = {"s", "S"}, T = {"t", "T"},
-        U = {"u", "U"}, V = {"v", "V"}, W = {"w", "W"}, X = {"x", "X"}, Y = {"y", "Y"},
-        Z = {"z", "Z"},
-        Zero = {"0", ")"}, One = {"1", "!"}, Two = {"2", "@"}, Three = {"3", "#"}, Four = {"4", "$"},
-        Five = {"5", "%"}, Six = {"6", "^"}, Seven = {"7", "&"}, Eight = {"8", "*"}, Nine = {"9", "("},
-        Space = {" ", " "}, Minus = {"-", "_"}, Equals = {"=", "+"},
-        Comma = {",", "<"}, Period = {".", ">"}, Slash = {"/", "?"},
-        Semicolon = {";", ":"}, LeftBracket = {"[", "{"}, RightBracket = {"]", "}"},
-    }
-    local TYPE_KEYS = {}
-    for k in pairs(TYPE_MAP) do TYPE_KEYS[#TYPE_KEYS + 1] = k end
-
-    local function vec2(x, y)
-        local fx, fy = math.floor(x + 0.5), math.floor(y + 0.5)
-        if Vector2 and Vector2.new then return Vector2.new(fx, fy) end
-        if type(vector) == "function" then return vector(fx, fy) end
-        return {X = fx, Y = fy}
-    end
-
     local function inRect(mx, my, x, y, w, h)
         return mx >= x and mx <= x + w and my >= y and my <= y + h
-    end
-
-    local function utf8Split(s)
-        s = tostring(s or "")
-        local out = {}
-        local i, n = 1, #s
-        while i <= n do
-            local b = string.byte(s, i)
-            local step = 1
-            if b >= 240 then step = 4
-            elseif b >= 224 then step = 3
-            elseif b >= 192 then step = 2 end
-            out[#out + 1] = string.sub(s, i, math.min(n, i + step - 1))
-            i = i + step
-        end
-        return out
-    end
-
-    local function utf8Trunc(s, maxChars, fromEnd)
-        local chars = utf8Split(s)
-        local n = #chars
-        if n <= maxChars then return tostring(s or "") end
-        if maxChars <= 2 then return table.concat(chars, "", 1, math.max(0, maxChars)) end
-        if fromEnd then
-            return ".." .. table.concat(chars, "", n - maxChars + 3, n)
-        end
-        return table.concat(chars, "", 1, maxChars - 2) .. ".."
-    end
-
-    local function utf8Pop(s)
-        local chars = utf8Split(s)
-        if #chars == 0 then return "" end
-        chars[#chars] = nil
-        return table.concat(chars)
-    end
-
-    local function wrapText(s, maxChars)
-        s = tostring(s or "")
-        if s == "" then return {""} end
-        local lines = {}
-        for rawLine in string.gmatch(s .. "\n", "([^\n]*)\n") do
-            local chars = utf8Split(rawLine)
-            if #chars <= maxChars then
-                lines[#lines + 1] = rawLine
-            else
-                local cur, curLen = "", 0
-                for word in string.gmatch(rawLine, "%S+") do
-                    local wc = utf8Split(word)
-                    local wl = #wc
-                    if curLen == 0 then
-                        if wl <= maxChars then
-                            cur, curLen = word, wl
-                        else
-                            local pos = 1
-                            while pos <= wl do
-                                lines[#lines + 1] = table.concat(wc, "", pos, math.min(wl, pos + maxChars - 1))
-                                pos = pos + maxChars
-                            end
-                        end
-                    elseif curLen + 1 + wl <= maxChars then
-                        cur = cur .. " " .. word
-                        curLen = curLen + 1 + wl
-                    else
-                        lines[#lines + 1] = cur
-                        if wl <= maxChars then
-                            cur, curLen = word, wl
-                        else
-                            cur, curLen = "", 0
-                            local pos = 1
-                            while pos <= wl do
-                                lines[#lines + 1] = table.concat(wc, "", pos, math.min(wl, pos + maxChars - 1))
-                                pos = pos + maxChars
-                            end
-                        end
-                    end
-                end
-                if curLen > 0 then lines[#lines + 1] = cur end
-            end
-        end
-        if #lines == 0 then lines[1] = "" end
-        return lines
-    end
-
-    local function measureTextW(s, size)
-        s = tostring(s or "")
-        size = size or 12
-        if type(render) == "table" and type(render.measure_text) == "function" then
-            local ok, v = pcall(render.measure_text, s, size)
-            if ok and v and finite(v.X) then return v.X end
-        end
-        return #utf8Split(s) * (size * 0.54)
     end
 
     local function getScreen()
@@ -3306,22 +3405,22 @@ do
         return false
     end
 
-    local function isChatTyping(bridgeTb)
+    local function isTyping()
         if uis then
             local okF, focused = pcall(function() return uis:GetFocusedTextBox() end)
-            if okF and focused ~= nil and focused ~= bridgeTb then return true end
+            if okF and focused ~= nil then return true end
         end
         if type(input) == "table" and type(input.is_typing) == "function" then
             local ok, v = pcall(input.is_typing)
-            if ok and v == true then
-                if uis and bridgeTb then
-                    local okF, focused = pcall(function() return uis:GetFocusedTextBox() end)
-                    if okF and focused == bridgeTb then return false end
-                end
-                return true
-            end
+            if ok and v == true then return true end
         end
         return false
+    end
+
+    local function releaseFocusedTextBox()
+        if not uis then return end
+        local okF, focused = pcall(function() return uis:GetFocusedTextBox() end)
+        if okF and focused then pcall(function() focused:ReleaseFocus() end) end
     end
 
     local function setCursor(open)
@@ -3340,7 +3439,7 @@ do
         local lp = players.LocalPlayer or localPlayer
         if lp then
             local ok, pg = pcall(function()
-                return lp:FindFirstChildOfClass("PlayerGui") or lp:FindFirstChild("PlayerGui")
+                return lp:FindFirstChildOfClass("PlayerGui") or lp:FindFirstChild("PlayerGui") or lp:WaitForChild("PlayerGui", 3)
             end)
             if ok and pg then return pg end
         end
@@ -3348,20 +3447,28 @@ do
         return (okCg and cg) or nil
     end
 
-    local function destroyDrawing(d)
-        if not d then return end
-        pcall(function() d.Visible = false end)
-        pcall(function() d.Parent = nil end)
-        pcall(function()
-            if type(d.Destroy) == "function" then d:Destroy()
-            elseif type(d.Remove) == "function" then d:Remove() end
-        end)
+    local guidSeq = 0
+    local function nextName()
+        guidSeq = guidSeq + 1
+        local ok, g = pcall(function() return hs:GenerateGUID(false) end)
+        if ok and type(g) == "string" and #g > 0 then return g end
+        return "ar_ui_" .. tostring(guidSeq)
+    end
+
+    local function newObj(cls, props)
+        local obj = Instance.new(cls)
+        local par = props.Parent
+        for k, v in pairs(props) do
+            if k ~= "Parent" then pcall(function() obj[k] = v end) end
+        end
+        if not props.Name then pcall(function() obj.Name = nextName() end) end
+        if par ~= nil then obj.Parent = par end
+        return obj
     end
 
     function SkeetUI.create(opts)
         opts = opts or {}
         local winW, winH = 658, 558
-        local sideW = 73
         local sw, sh = getScreen()
         local winX = opts.posX or math.max(12, math.floor((sw - winW) * 0.5))
         local winY = opts.posY or math.max(12, math.floor((sh - winH) * 0.5))
@@ -3369,322 +3476,10 @@ do
         winY = math.clamp(winY, 4, math.max(4, sh - winH))
 
         local uiAlive = true
-        local uiDirty = true
         local accentColor = ACCENTS[opts.accent] or ACCENTS["Skeet Green"]
-
-        local pc = {}
-        local rectPool, textPool, allDrawings = {}, {}, {}
-        local rectIdx, textIdx = 0, 0
-        local prevRectIdx, prevTextIdx = 0, 0
-
-        local function getCache(d)
-            local c = pc[d]
-            if not c then
-                c = {vis = false}
-                pc[d] = c
-            end
-            return c
-        end
-
-        local function hideObj(d)
-            if not d then return end
-            local c = getCache(d)
-            if c.vis then
-                c.vis = false
-                pcall(function() d.Visible = false end)
-            end
-        end
-
-        -- Dedicated 2-object circular cursor indicator (updates independently at 0ms without redrawing menu)
-        local function makeCursorDot(sz, z, col)
-            local d = Drawing.new("Square")
-            pcall(function() d.Parent = nil end)
-            pcall(function() d.Filled = true end)
-            pcall(function() d.Rounding = 999 end)
-            pcall(function() d.Thickness = 0 end)
-            d.Size = vec2(sz, sz)
-            d.Color = col
-            d.ZIndex = z
-            d.Visible = false
-            allDrawings[#allDrawings + 1] = d
-            return d
-        end
-        local curOut = makeCursorDot(8, 98, BG_PURE_BLK)
-        local curIn = makeCursorDot(6, 99, accentColor)
-        local curVis = false
-        local curX, curY = -999, -999
-
-        local function updateCursorDot(mx, my, show)
-            if not show then
-                if curVis then
-                    curVis = false
-                    pcall(function() curOut.Visible = false; curIn.Visible = false end)
-                end
-                return
-            end
-            local fx, fy = math.floor(mx + 0.5), math.floor(my + 0.5)
-            if fx ~= curX or fy ~= curY then
-                curX, curY = fx, fy
-                curOut.Position = vec2(fx - 4, fy - 4)
-                curIn.Position = vec2(fx - 3, fy - 3)
-            end
-            if not curVis then
-                curVis = true
-                curOut.Visible = true
-                curIn.Visible = true
-            end
-        end
-
-        -- Dedicated 2-segment GPU gradient rainbow strip (2 GuiObjects instead of 24)
-        local rbLeft, rbRight = nil, nil
-        local useGpuRainbow = false
-        pcall(function()
-            local a = Drawing.new("Square")
-            local b = Drawing.new("Square")
-            pcall(function() a.Parent = nil; b.Parent = nil end)
-            pcall(function() a.Filled = true; b.Filled = true end)
-            pcall(function() a.Rounding = 0; b.Rounding = 0 end)
-            a.Color = RB_CYAN; b.Color = RB_MAGENTA
-            a.ZIndex = 16; b.ZIndex = 16
-            a.Visible = false; b.Visible = false
-            local okG1 = pcall(function() a.Gradient = {RB_CYAN, RB_MAGENTA, 0} end)
-            local okG2 = pcall(function() b.Gradient = {RB_MAGENTA, RB_LIME, 0} end)
-            if okG1 and okG2 then
-                rbLeft, rbRight = a, b
-                useGpuRainbow = true
-                allDrawings[#allDrawings + 1] = a
-                allDrawings[#allDrawings + 1] = b
-            else
-                destroyDrawing(a); destroyDrawing(b)
-            end
-        end)
-
-        -- Probe BorderColor once so drawBox3 can use 2 Squares instead of 3
-        local hasBorderColor = false
-        pcall(function()
-            local probe = Drawing.new("Square")
-            probe.Visible = false
-            local okB = pcall(function() probe.BorderColor = BORDER_LIGHT end)
-            hasBorderColor = okB == true
-            destroyDrawing(probe)
-        end)
-
-        local function drawRect(x, y, w, h, col, z, borderCol)
-            if w <= 0 or h <= 0 then return end
-            rectIdx = rectIdx + 1
-            local d = rectPool[rectIdx]
-            if not d then
-                d = Drawing.new("Square")
-                pcall(function() d.Parent = nil end)
-                pcall(function() d.Filled = true end)
-                pcall(function() d.Rounding = 0 end)
-                pcall(function() d.Thickness = 0 end)
-                d.Visible = false
-                rectPool[rectIdx] = d
-                allDrawings[#allDrawings + 1] = d
-            end
-            local c = getCache(d)
-            local fx, fy = math.floor(x + 0.5), math.floor(y + 0.5)
-            local fw, fh = math.max(1, math.floor(w + 0.5)), math.max(1, math.floor(h + 0.5))
-            local rz = z or 10
-            if c.x ~= fx or c.y ~= fy then d.Position = vec2(fx, fy); c.x, c.y = fx, fy end
-            if c.w ~= fw or c.h ~= fh then d.Size = vec2(fw, fh); c.w, c.h = fw, fh end
-            if c.col ~= col then d.Color = col; c.col = col end
-            if c.z ~= rz then d.ZIndex = rz; c.z = rz end
-            if hasBorderColor then
-                local bc = borderCol or col
-                if c.bc ~= bc then pcall(function() d.BorderColor = bc end); c.bc = bc end
-            end
-            if not c.vis then d.Visible = true; c.vis = true end
-        end
-
-        local function drawText(x, y, str, col, sz, z, center, bold)
-            str = tostring(str or "")
-            if str == "" then return end
-            textIdx = textIdx + 1
-            local d = textPool[textIdx]
-            if not d then
-                d = Drawing.new("Text")
-                pcall(function() d.Parent = nil end)
-                pcall(function() d.Outline = false end)
-                d.Visible = false
-                textPool[textIdx] = d
-                allDrawings[#allDrawings + 1] = d
-            end
-            local c = getCache(d)
-            local fx, fy = math.floor(x + 0.5), math.floor(y + 0.5)
-            local fsz = sz or 12
-            local rz = z or 29
-            local ctr = center == true
-            local fnt = bold and 2 or 0
-            if c.str ~= str then d.Text = str; c.str = str end
-            if c.col ~= col then d.Color = col; c.col = col end
-            if c.sz ~= fsz then d.Size = fsz; c.sz = fsz end
-            if c.z ~= rz then d.ZIndex = rz; c.z = rz end
-            if c.ctr ~= ctr then pcall(function() d.Center = ctr end); c.ctr = ctr end
-            if c.fnt ~= fnt then pcall(function() d.Font = fnt end); c.fnt = fnt end
-            if c.x ~= fx or c.y ~= fy then d.Position = vec2(fx, fy); c.x, c.y = fx, fy end
-            if not c.vis then d.Visible = true; c.vis = true end
-        end
-
-        local function drawBox3(x, y, w, h, fillCol, zBase, borderCol)
-            local bc = borderCol or BORDER_LIGHT
-            if hasBorderColor then
-                drawRect(x, y, w, h, BG_BLACK, zBase, BG_BLACK)
-                drawRect(x + 2, y + 2, w - 4, h - 4, fillCol, zBase + 2, bc)
-            else
-                drawRect(x, y, w, h, BG_BLACK, zBase)
-                drawRect(x + 1, y + 1, w - 2, h - 2, bc, zBase + 1)
-                drawRect(x + 2, y + 2, w - 4, h - 4, fillCol, zBase + 2)
-            end
-        end
-
-        local function beginFrame()
-            rectIdx, textIdx = 0, 0
-        end
-
-        local function endFrame()
-            for i = rectIdx + 1, prevRectIdx do hideObj(rectPool[i]) end
-            for i = textIdx + 1, prevTextIdx do hideObj(textPool[i]) end
-            prevRectIdx, prevTextIdx = rectIdx, textIdx
-        end
-
-        local function makeIconImg(asset)
-            if type(asset) ~= "string" or #asset == 0 then return nil end
-            if type(render) == "table" and type(render.image) == "function" then
-                local okR, dR = pcall(render.image, 0, 0, 40, 40, asset, TAB_IDLE, 0, 18)
-                if okR and dR then
-                    pcall(function() dR.Visible = false end)
-                    allDrawings[#allDrawings + 1] = dR
-                    return dR
-                end
-            end
-            local ok, img = pcall(function()
-                local d = Drawing.new("Image")
-                pcall(function() d.Parent = nil end)
-                local setOk = pcall(function() d.Image = asset end)
-                if not setOk then setOk = pcall(function() d.Uri = asset end) end
-                if not setOk then destroyDrawing(d); return nil end
-                d.Visible = false
-                return d
-            end)
-            if ok and img then
-                allDrawings[#allDrawings + 1] = img
-                return img
-            end
-            return nil
-        end
-
-        local function drawIcon(img, x, y, w, h, col, z)
-            if not img then return false end
-            local c = getCache(img)
-            local fx, fy = math.floor(x + 0.5), math.floor(y + 0.5)
-            local fw, fh = math.floor(w + 0.5), math.floor(h + 0.5)
-            local ok = pcall(function()
-                if c.x ~= fx or c.y ~= fy then img.Position = vec2(fx, fy); c.x, c.y = fx, fy end
-                if c.w ~= fw or c.h ~= fh then img.Size = vec2(fw, fh); c.w, c.h = fw, fh end
-                if c.col ~= col then
-                    local okC = pcall(function() img.ImageColor = col end)
-                    if not okC then pcall(function() img.Color = col end) end
-                    c.col = col
-                end
-                if c.z ~= z then img.ZIndex = z; c.z = z end
-                if not c.vis then img.Visible = true; c.vis = true end
-            end)
-            return ok
-        end
-
-        -- Off-screen native TextBox bridge for seamless Ctrl+V paste & Cyrillic typing
-        local bridgeGui, bridgeTb = nil, nil
-        local bridgeSuppress = false
+        local accentUpdaters = {}
         local connections = {}
-        local function track(conn)
-            if conn ~= nil then connections[#connections + 1] = conn end
-            return conn
-        end
 
-        local focusedBox = nil
-        local focusBoxRect = nil
-        local typePrev = {}
-        local bkspHoldAt = 0
-
-        local function refreshBoxDisplay(wb)
-            wb._dispVal = utf8Trunc(wb.value, 32, true)
-            wb._dispCaret = utf8Trunc(wb.value .. "_", 32, true)
-            uiDirty = true
-        end
-
-        local function commitFocusedBox()
-            local wb = focusedBox
-            if not wb then return end
-            focusedBox = nil
-            focusBoxRect = nil
-            uiDirty = true
-            if bridgeTb then
-                pcall(function()
-                    if uis and uis:GetFocusedTextBox() == bridgeTb then bridgeTb:ReleaseFocus() end
-                end)
-            end
-            if not wb.readOnly and wb.callback then pcall(wb.callback, wb.value) end
-        end
-
-        local function ensureBridge()
-            if bridgeTb then return bridgeTb end
-            pcall(function()
-                local par = getGuiParent()
-                if not par then return end
-                bridgeGui = Instance.new("ScreenGui")
-                bridgeGui.Name = "AR_TextBridge"
-                bridgeGui.ResetOnSpawn = false
-                bridgeGui.DisplayOrder = 1
-                bridgeGui.Parent = par
-                bridgeTb = Instance.new("TextBox")
-                bridgeTb.BackgroundTransparency = 1
-                bridgeTb.TextTransparency = 1
-                bridgeTb.ClearTextOnFocus = false
-                bridgeTb.Position = UDim2.new(0, -600, 0, -600)
-                bridgeTb.Size = UDim2.new(0, 10, 0, 10)
-                bridgeTb.Text = ""
-                bridgeTb.Parent = bridgeGui
-                track(bridgeTb:GetPropertyChangedSignal("Text"):Connect(function()
-                    if bridgeSuppress or not uiAlive or not focusedBox or focusedBox.readOnly then return end
-                    local nv = tostring(bridgeTb.Text or "")
-                    if nv ~= focusedBox.value then
-                        focusedBox.value = nv
-                        refreshBoxDisplay(focusedBox)
-                    end
-                end))
-                track(bridgeTb.FocusLost:Connect(function()
-                    if bridgeSuppress or not uiAlive or not focusedBox then return end
-                    commitFocusedBox()
-                end))
-            end)
-            return bridgeTb
-        end
-
-        local function focusBox(wb, rect)
-            if focusedBox and focusedBox ~= wb then commitFocusedBox() end
-            focusedBox = wb
-            focusBoxRect = rect
-            typePrev = {}
-            bkspHoldAt = 0
-            uiDirty = true
-            if wb.readOnly and type(setclipboard) == "function" and #wb.value > 0 then
-                pcall(setclipboard, wb.value)
-            end
-            local tb = ensureBridge()
-            if tb then
-                bridgeSuppress = true
-                pcall(function()
-                    tb.TextEditable = not wb.readOnly
-                    tb.Text = tostring(wb.value or "")
-                end)
-                bridgeSuppress = false
-                pcall(function() tb:CaptureFocus() end)
-            end
-        end
-
-        -- Interaction state
         local activePopup = nil
         local activeSlider = nil
         local activeScrollDrag = nil
@@ -3693,20 +3488,184 @@ do
         local ignoreToggleUntil = 0
         local nextCursorCheck = 0
         local nextHoverAt = 0
-        local flashActiveUntil = 0
-        local prevMx, prevMy = -1, -1
-        local prevCaretBlink = -1
+        local prevMx, prevMy = -999, -999
+        local curDotX, curDotY = -999, -999
         local prevDown = false
         local prevToggleDown = false
         local lastClickAt = -10
         local uisWheelAccum = 0
+        local hoveredTabIdx = nil
+        local hoveredWidget = nil
+        local hoveredPopIdx = nil
+
+        local function track(conn)
+            if conn ~= nil then connections[#connections + 1] = conn end
+            return conn
+        end
 
         local function closePopup()
             if activePopup then
+                local pop = activePopup
                 activePopup = nil
-                uiDirty = true
+                hoveredPopIdx = nil
+                if pop.closeFn then pcall(pop.closeFn)
+                else pcall(function() pop.frame:Destroy() end) end
             end
         end
+
+        local function clearHover()
+            if hoveredWidget and hoveredWidget.setHover then pcall(hoveredWidget.setHover, false) end
+            hoveredWidget = nil
+            if hoveredTabIdx then
+                hoveredTabIdx = nil
+            end
+        end
+
+        -- Exact skeet.lua ScreenGui hierarchy
+        local screenGui = newObj("ScreenGui", {
+            Name = "AntiResolver_SkeetUI",
+            ResetOnSpawn = false,
+            IgnoreGuiInset = true,
+            DisplayOrder = 50000,
+            ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+            Parent = getGuiParent(),
+        })
+
+        local border = newObj("Frame", {
+            Active = false,
+            BackgroundColor3 = Color3.fromRGB(60, 60, 60),
+            BorderColor3 = BG_DARK,
+            Position = UDim2.new(0, winX, 0, winY),
+            Size = UDim2.new(0, winW, 0, winH),
+            ZIndex = 1,
+            Parent = screenGui,
+        })
+        -- Invisible Modal button keeps Roblox first-person cursor unlocked while menu is open
+        newObj("TextButton", {
+            AutoButtonColor = false,
+            Active = false,
+            Modal = true,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 0, 0, 0),
+            Size = UDim2.new(0, 1, 0, 1),
+            Text = "",
+            ZIndex = 0,
+            Parent = border,
+        })
+
+        local border2 = newObj("Frame", {
+            BackgroundColor3 = BORDER_LIGHT,
+            BorderColor3 = BORDER_LIGHT,
+            Position = UDim2.new(0, 2, 0, 2),
+            Size = UDim2.new(1, -4, 1, -4),
+            Parent = border,
+        })
+        local bg = newObj("ImageLabel", {
+            BackgroundColor3 = Color3.fromRGB(20, 20, 20),
+            BorderColor3 = Color3.fromRGB(60, 60, 60),
+            Position = UDim2.new(0, 3, 0, 3),
+            Size = UDim2.new(1, -6, 1, -6),
+            Image = "rbxassetid://15453092054",
+            ScaleType = Enum.ScaleType.Tile,
+            TileSize = UDim2.new(0, 4, 0, 548),
+            Parent = border2,
+        })
+
+        -- Exact skeet.lua top rainbow image + 1px dark shadow
+        local topRainbow = newObj("ImageLabel", {
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+            BorderColor3 = BG_DARK,
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 1, 0, 1),
+            Size = UDim2.new(1, -2, 0, 2),
+            ZIndex = 4,
+            Image = "rbxassetid://15453122383",
+            Parent = bg,
+        })
+        newObj("Frame", {
+            BackgroundColor3 = Color3.fromRGB(6, 6, 6),
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 0, 1, 0),
+            Size = UDim2.new(1, 0, 0, 1),
+            ZIndex = 4,
+            Parent = topRainbow,
+        })
+
+        local topGap = newObj("Frame", {
+            BackgroundColor3 = BG_DARK,
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 0, 0, 4),
+            Size = UDim2.new(0, 73, 0, 14),
+            Parent = bg,
+        })
+        local topSideFix = newObj("Frame", {
+            BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 73, 0, 0),
+            Size = UDim2.new(0, 1, 1, 0),
+            Parent = topGap,
+        })
+        newObj("Frame", {
+            BackgroundColor3 = BORDER_LIGHT,
+            BorderSizePixel = 0,
+            Position = UDim2.new(1, 0, 0, 0),
+            Size = UDim2.new(0, 1, 1, 0),
+            Parent = topSideFix,
+        })
+
+        local tabHolder = newObj("Frame", {
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 0, 0, 18),
+            Size = UDim2.new(0, 73, 0, 256),
+            Parent = bg,
+        })
+
+        local bottomGap = newObj("Frame", {
+            BackgroundColor3 = BG_DARK,
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 0, 0, 274),
+            Size = UDim2.new(0, 73, 1, -274),
+            Parent = bg,
+        })
+        local botSideFix = newObj("Frame", {
+            BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 73, 0, 0),
+            Size = UDim2.new(0, 1, 1, 0),
+            Parent = bottomGap,
+        })
+        newObj("Frame", {
+            BackgroundColor3 = BORDER_LIGHT,
+            BorderSizePixel = 0,
+            Position = UDim2.new(1, 0, 0, 0),
+            Size = UDim2.new(0, 1, 1, 0),
+            Parent = botSideFix,
+        })
+
+        -- Crisp circular cursor dot inside the same ScreenGui (always on top of menu & popups, 1:1 with hit-test coords)
+        local curDot = newObj("Frame", {
+            Active = false,
+            BackgroundColor3 = accentColor,
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, -50, 0, -50),
+            Size = UDim2.new(0, 7, 0, 7),
+            ZIndex = 200,
+            Parent = screenGui,
+        })
+        newObj("UICorner", {CornerRadius = UDim.new(1, 0), Parent = curDot})
+        newObj("UIStroke", {Color = Color3.fromRGB(0, 0, 0), Thickness = 1.2, Parent = curDot})
+        accentUpdaters[#accentUpdaters + 1] = function(c) curDot.BackgroundColor3 = c end
+
+        local win = {
+            tabs = {},
+            activeTab = 1,
+            isOpen = true,
+            toggleKey = opts.toggleKey or "RightShift",
+            onTabChanged = nil,
+            onPositionSaved = opts.onPositionSaved,
+        }
 
         if uis then
             track(uis.InputChanged:Connect(function(inp)
@@ -3722,7 +3681,6 @@ do
                     local target = capturingKey
                     capturingKey = nil
                     ignoreToggleUntil = nowSafe() + 0.30
-                    uiDirty = true
                     if kName == "Escape" then target.cancel()
                     elseif kName ~= "Unknown" and kName ~= "" then target.apply(kName)
                     else target.cancel() end
@@ -3730,31 +3688,11 @@ do
             end))
         end
 
-        local win = {
-            tabs = {},
-            activeTab = 1,
-            isOpen = true,
-            toggleKey = opts.toggleKey or "RightShift",
-            onTabChanged = nil,
-            onPositionSaved = opts.onPositionSaved,
-        }
-
-        local function hideAll()
-            for i = 1, prevRectIdx do hideObj(rectPool[i]) end
-            for i = 1, prevTextIdx do hideObj(textPool[i]) end
-            prevRectIdx, prevTextIdx = 0, 0
-            hideObj(rbLeft); hideObj(rbRight)
-            for i = 1, #win.tabs do hideObj(win.tabs[i].iconImg) end
-            updateCursorDot(0, 0, false)
-        end
-
         function win:setAccent(name)
             local c = ACCENTS[name]
-            if c and c ~= accentColor then
-                accentColor = c
-                pcall(function() curIn.Color = c end)
-                uiDirty = true
-            end
+            if not c then return end
+            accentColor = c
+            for i = 1, #accentUpdaters do pcall(accentUpdaters[i], c) end
         end
 
         function win:setHint() end
@@ -3762,16 +3700,15 @@ do
         function win:setOpen(open)
             open = open == true
             win.isOpen = open
+            screenGui.Enabled = open
             if not open then
                 closePopup()
                 activeSlider = nil
                 activeScrollDrag = nil
                 dragWin = nil
-                commitFocusedBox()
+                clearHover()
+                releaseFocusedTextBox()
                 if capturingKey then capturingKey.cancel(); capturingKey = nil end
-                hideAll()
-            else
-                uiDirty = true
             end
             setCursor(open)
         end
@@ -3787,7 +3724,7 @@ do
                     boundKeys[k] = true
                     input.on_key_press(k, function()
                         local now = nowSafe()
-                        if not uiAlive or capturingKey or focusedBox or isChatTyping(bridgeTb) or now < ignoreToggleUntil then return end
+                        if not uiAlive or capturingKey or isTyping() or now < ignoreToggleUntil then return end
                         if win.toggleKey == k then
                             ignoreToggleUntil = now + 0.25
                             win:toggle()
@@ -3809,73 +3746,195 @@ do
             closePopup()
             activeSlider = nil
             activeScrollDrag = nil
-            commitFocusedBox()
+            clearHover()
+            releaseFocusedTextBox()
             win.activeTab = idx
-            uiDirty = true
+            for i = 1, #win.tabs do
+                local t = win.tabs[i]
+                local act = (i == idx)
+                t.icon.ImageColor3 = act and TAB_ACT or TAB_IDLE
+                t.lbl.TextColor3 = act and TAB_ACT or TAB_IDLE
+                t.topBar.Visible = act
+                t.botBar.Visible = act
+                t.sideBar.Visible = not act
+                t.button.BackgroundTransparency = act and 1 or 0
+                t.frame.Visible = act
+            end
             if win.onTabChanged then pcall(win.onTabChanged, idx) end
         end
 
-        local function attachWidgets(sec)
+        local function attachWidgets(sec, contentScroll)
+            local function relayout()
+                local curY = 0
+                for i = 1, #sec.widgets do
+                    local w = sec.widgets[i]
+                    if w.visible then
+                        w._relY = curY
+                        w.root.Position = UDim2.new(0, 0, 0, curY)
+                        w.root.Size = UDim2.new(1, -6, 0, w._h)
+                        curY = curY + w._h + 6
+                    end
+                end
+                sec.totalH = curY
+                sec.maxScroll = math.max(0, curY - sec.viewH)
+                sec.scrollY = math.clamp(sec.scrollY, 0, sec.maxScroll)
+                pcall(function()
+                    contentScroll.CanvasSize = UDim2.new(0, 0, 0, curY + 8)
+                    contentScroll.CanvasPosition = Vector2.new(0, sec.scrollY)
+                end)
+                sec.lastNativeY = sec.scrollY
+            end
+            sec.relayout = relayout
+
             function sec:newLabel(text, col)
                 local str = tostring(text or "")
-                local lines = wrapText(str, 34)
-                local w = {kind = "label", text = str, col = col or TEXT_NORM, visible = true, _lines = lines, _h = #lines * 14 + 2}
+                local h0 = (#str > 34 or str:find("\n", 1, true)) and 30 or 16
+                local lbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, -6, 0, h0),
+                    Font = Enum.Font.SourceSans,
+                    Text = str,
+                    TextColor3 = col or TEXT_NORM,
+                    TextSize = 13,
+                    TextWrapped = true,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    TextYAlignment = Enum.TextYAlignment.Top,
+                    Parent = contentScroll,
+                })
+                local w = {kind = "label", root = lbl, visible = true, _h = h0, _relY = 0}
                 sec.widgets[#sec.widgets + 1] = w
-                uiDirty = true
+                relayout()
                 return {
-                    get = function() return w.text end,
+                    get = function() return lbl.Text end,
                     set = function(v)
                         local nv = tostring(v or "")
-                        if nv == w.text then return end
-                        w.text = nv
-                        w._lines = wrapText(nv, 34)
-                        w._h = #w._lines * 14 + 2
-                        uiDirty = true
+                        if nv == lbl.Text then return end
+                        lbl.Text = nv
+                        local nh = (#nv > 34 or nv:find("\n", 1, true)) and 30 or 16
+                        if nh ~= w._h then w._h = nh; relayout() end
                     end,
-                    setColor = function(c) if c ~= w.col then w.col = c; uiDirty = true end end,
+                    setColor = function(c) lbl.TextColor3 = c end,
                     setVisible = function(vis)
                         vis = vis == true
-                        if vis ~= w.visible then w.visible = vis; uiDirty = true end
+                        if vis ~= w.visible then w.visible = vis; lbl.Visible = vis; relayout() end
                     end,
                 }
             end
 
             function sec:newButton(name, callback)
-                local s = tostring(name or "Button")
-                local w = {kind = "button", name = s, _dispName = utf8Trunc(s, 34, false), callback = callback, visible = true, flashUntil = 0, _h = 22}
-                sec.widgets[#sec.widgets + 1] = w
-                uiDirty = true
-                return {
-                    setText = function(v)
-                        local nv = tostring(v or "")
-                        if nv ~= w.name then w.name = nv; w._dispName = utf8Trunc(nv, 34, false); uiDirty = true end
+                local outer = newObj("Frame", {
+                    Active = false,
+                    BackgroundColor3 = BG_DARK,
+                    BorderSizePixel = 0,
+                    Size = UDim2.new(1, -6, 0, 22),
+                    Parent = contentScroll,
+                })
+                local inner = newObj("Frame", {
+                    BackgroundColor3 = BORDER_LIGHT,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = outer,
+                })
+                local fill = newObj("Frame", {
+                    BackgroundColor3 = BG_CTRL,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = inner,
+                })
+                local lbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, 0, 1, 0),
+                    Font = Enum.Font.SourceSans,
+                    Text = tostring(name or "Button"),
+                    TextColor3 = TEXT_NORM,
+                    TextSize = 13,
+                    Parent = fill,
+                })
+                local w = {
+                    kind = "button", root = outer, visible = true, _h = 22, _relY = 0,
+                    setHover = function(hov)
+                        fill.BackgroundColor3 = hov and BG_CTRL_HOV or BG_CTRL
+                        lbl.TextColor3 = hov and TEXT_BRIGHT or TEXT_NORM
                     end,
+                    onClick = function()
+                        fill.BackgroundColor3 = BG_CTRL_ACT
+                        if type(task) == "table" and type(task.delay) == "function" then
+                            task.delay(0.09, function() if uiAlive then fill.BackgroundColor3 = BG_CTRL end end)
+                        end
+                        if callback then pcall(callback) end
+                    end,
+                }
+                sec.widgets[#sec.widgets + 1] = w
+                relayout()
+                return {
+                    setText = function(v) lbl.Text = tostring(v or "") end,
                     setVisible = function(vis)
                         vis = vis == true
-                        if vis ~= w.visible then w.visible = vis; uiDirty = true end
+                        if vis ~= w.visible then w.visible = vis; outer.Visible = vis; relayout() end
                     end,
                 }
             end
 
             function sec:newToggle(name, default, callback)
-                local s = tostring(name or "Toggle")
-                local w = {kind = "toggle", name = s, _dispName = utf8Trunc(s, 32, false), value = default == true, callback = callback, visible = true, _h = 16}
+                local state = default == true
+                local row = newObj("Frame", {
+                    Active = false,
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, -6, 0, 16),
+                    Parent = contentScroll,
+                })
+                local boxBorder = newObj("Frame", {
+                    BackgroundColor3 = BG_DARK,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 0, 0, 3),
+                    Size = UDim2.new(0, 10, 0, 10),
+                    Parent = row,
+                })
+                local boxFill = newObj("Frame", {
+                    BackgroundColor3 = state and accentColor or BORDER_LIGHT,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = boxBorder,
+                })
+                local lbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Position = UDim2.new(0, 18, 0, 0),
+                    Size = UDim2.new(1, -18, 1, 0),
+                    Font = Enum.Font.SourceSans,
+                    Text = tostring(name or "Toggle"),
+                    TextColor3 = state and TEXT_BRIGHT or TEXT_NORM,
+                    TextSize = 13,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    Parent = row,
+                })
+                local isHov = false
+                local function paint()
+                    boxFill.BackgroundColor3 = state and accentColor or (isHov and Color3.fromRGB(54, 54, 54) or BORDER_LIGHT)
+                    lbl.TextColor3 = state and TEXT_BRIGHT or TEXT_NORM
+                end
+                accentUpdaters[#accentUpdaters + 1] = function() paint() end
+                local function setVal(v, silent)
+                    state = v == true
+                    paint()
+                    if not silent and callback then pcall(callback, state) end
+                end
+                local w = {
+                    kind = "toggle", root = row, visible = true, _h = 16, _relY = 0,
+                    setHover = function(hov) isHov = hov == true; paint() end,
+                    onClick = function() setVal(not state, false) end,
+                }
                 sec.widgets[#sec.widgets + 1] = w
-                uiDirty = true
+                relayout()
                 return {
-                    get = function() return w.value end,
-                    set = function(v, silent)
-                        local nv = v == true
-                        if nv ~= w.value then w.value = nv; uiDirty = true end
-                        if not silent and w.callback then pcall(w.callback, w.value) end
-                    end,
-                    setText = function(v)
-                        local nv = tostring(v or "")
-                        if nv ~= w.name then w.name = nv; w._dispName = utf8Trunc(nv, 32, false); uiDirty = true end
-                    end,
+                    get = function() return state end,
+                    set = function(v, silent) setVal(v, silent) end,
+                    setText = function(v) lbl.Text = tostring(v or "") end,
                     setVisible = function(vis)
                         vis = vis == true
-                        if vis ~= w.visible then w.visible = vis; uiDirty = true end
+                        if vis ~= w.visible then w.visible = vis; row.Visible = vis; relayout() end
                     end,
                 }
             end
@@ -3884,38 +3943,86 @@ do
                 minVal = tonumber(minVal) or 0
                 maxVal = tonumber(maxVal) or 100
                 if maxVal <= minVal then maxVal = minVal + 1 end
-                local s = tostring(name or "Slider")
-                local suf = tostring(suffix or "")
-                local v0 = roundInt(math.clamp(tonumber(default) or minVal, minVal, maxVal))
-                local vs0 = tostring(v0) .. suf
+                suffix = tostring(suffix or "")
+                local value = roundInt(math.clamp(tonumber(default) or minVal, minVal, maxVal))
+
+                local holder = newObj("Frame", {
+                    Active = false,
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, -6, 0, 28),
+                    Parent = contentScroll,
+                })
+                local titleLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(0.70, 0, 0, 14),
+                    Font = Enum.Font.SourceSans,
+                    Text = tostring(name or "Slider"),
+                    TextColor3 = TEXT_NORM,
+                    TextSize = 13,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    Parent = holder,
+                })
+                local valLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Position = UDim2.new(0.70, 0, 0, 0),
+                    Size = UDim2.new(0.30, 0, 0, 14),
+                    Font = Enum.Font.SourceSans,
+                    Text = tostring(value) .. suffix,
+                    TextColor3 = Color3.fromRGB(220, 220, 220),
+                    TextSize = 12,
+                    TextXAlignment = Enum.TextXAlignment.Right,
+                    Parent = holder,
+                })
+                local trackOuter = newObj("Frame", {
+                    Active = false,
+                    BackgroundColor3 = BG_DARK,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 0, 0, 17),
+                    Size = UDim2.new(1, 0, 0, 8),
+                    Parent = holder,
+                })
+                local trackIn = newObj("Frame", {
+                    BackgroundColor3 = Color3.fromRGB(34, 34, 34),
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = trackOuter,
+                })
+                local fillBar = newObj("Frame", {
+                    BackgroundColor3 = accentColor,
+                    BorderSizePixel = 0,
+                    Size = UDim2.new((value - minVal) / (maxVal - minVal), 0, 1, 0),
+                    Parent = trackIn,
+                })
+                accentUpdaters[#accentUpdaters + 1] = function(c) fillBar.BackgroundColor3 = c end
+
+                local function setVal(newVal, silent)
+                    local nextV = roundInt(math.clamp(tonumber(newVal) or minVal, minVal, maxVal))
+                    local changed = nextV ~= value
+                    value = nextV
+                    fillBar.Size = UDim2.new((value - minVal) / (maxVal - minVal), 0, 1, 0)
+                    valLbl.Text = tostring(value) .. suffix
+                    if not silent and changed and callback then pcall(callback, value) end
+                end
+                local function applyX(mx, trackLeft, trackWidth)
+                    if trackWidth <= 0 then return end
+                    local a = math.clamp((mx - trackLeft) / trackWidth, 0, 1)
+                    setVal(minVal + a * (maxVal - minVal), false)
+                end
+
                 local w = {
-                    kind = "slider", name = s, _dispName = utf8Trunc(s, 25, false),
-                    minVal = minVal, maxVal = maxVal, value = v0, suffix = suf,
-                    _valStr = vs0, _valW = measureTextW(vs0, 11),
-                    callback = callback, visible = true, _h = 28,
+                    kind = "slider", root = holder, visible = true, _h = 28, _relY = 0,
+                    applyX = applyX,
                 }
                 sec.widgets[#sec.widgets + 1] = w
-                uiDirty = true
+                relayout()
                 return {
-                    get = function() return w.value end,
-                    set = function(v, silent)
-                        local nv = roundInt(math.clamp(tonumber(v) or w.minVal, w.minVal, w.maxVal))
-                        local ch = nv ~= w.value
-                        if ch then
-                            w.value = nv
-                            w._valStr = tostring(nv) .. w.suffix
-                            w._valW = measureTextW(w._valStr, 11)
-                            uiDirty = true
-                        end
-                        if not silent and ch and w.callback then pcall(w.callback, w.value) end
-                    end,
-                    setText = function(v)
-                        local nv = tostring(v or "")
-                        if nv ~= w.name then w.name = nv; w._dispName = utf8Trunc(nv, 25, false); uiDirty = true end
-                    end,
+                    get = function() return value end,
+                    set = function(v, silent) setVal(v, silent) end,
+                    setText = function(v) titleLbl.Text = tostring(v or "") end,
                     setVisible = function(vis)
                         vis = vis == true
-                        if vis ~= w.visible then w.visible = vis; uiDirty = true end
+                        if vis ~= w.visible then w.visible = vis; holder.Visible = vis; relayout() end
                     end,
                 }
             end
@@ -3926,132 +4033,348 @@ do
                 if default ~= nil then
                     for i = 1, #list do if list[i] == default then selIdx = i; break end end
                 end
-                local s = tostring(name or "Dropdown")
-                local dispOpts = {}
-                for i = 1, #list do dispOpts[i] = utf8Trunc(tostring(list[i] or ""), 31, false) end
+                local holder = newObj("Frame", {
+                    Active = false,
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, -6, 0, 38),
+                    Parent = contentScroll,
+                })
+                local titleLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, 0, 0, 14),
+                    Font = Enum.Font.SourceSans,
+                    Text = tostring(name or "Dropdown"),
+                    TextColor3 = TEXT_NORM,
+                    TextSize = 13,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    Parent = holder,
+                })
+                local box = newObj("Frame", {
+                    Active = false,
+                    BackgroundColor3 = BG_DARK,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 0, 0, 16),
+                    Size = UDim2.new(1, 0, 0, 20),
+                    Parent = holder,
+                })
+                local boxIn = newObj("Frame", {
+                    BackgroundColor3 = BORDER_LIGHT,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = box,
+                })
+                local boxFill = newObj("Frame", {
+                    BackgroundColor3 = BG_CTRL,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = boxIn,
+                })
+                local selLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Position = UDim2.new(0, 6, 0, 0),
+                    Size = UDim2.new(1, -20, 1, 0),
+                    Font = Enum.Font.SourceSans,
+                    Text = tostring(list[selIdx]),
+                    TextColor3 = TEXT_NORM,
+                    TextSize = 12,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ClipsDescendants = true,
+                    Parent = boxFill,
+                })
+                local arrowLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Position = UDim2.new(1, -14, 0, 0),
+                    Size = UDim2.new(0, 12, 1, 0),
+                    Font = Enum.Font.SourceSans,
+                    Text = "v",
+                    TextColor3 = Color3.fromRGB(150, 150, 150),
+                    TextSize = 11,
+                    Parent = boxFill,
+                })
+
+                local myPopFrame = nil
+                local function myClose()
+                    if myPopFrame then pcall(function() myPopFrame:Destroy() end); myPopFrame = nil end
+                    if activePopup and activePopup.owner == box then activePopup = nil; hoveredPopIdx = nil end
+                    arrowLbl.Text = "v"
+                end
+                local function pick(idx, silent)
+                    selIdx = math.clamp(idx, 1, #list)
+                    selLbl.Text = tostring(list[selIdx])
+                    if not silent and callback then pcall(callback, list[selIdx]) end
+                end
+                local function openAt(bx, by, bw)
+                    local wasMine = activePopup and activePopup.owner == box
+                    closePopup()
+                    if wasMine then return end
+                    local _, curH = getScreen()
+                    local rowH = 19
+                    local popH = math.min(#list * rowH + 4, 194)
+                    local py = by + 21
+                    if py + popH > curH - 8 then py = math.max(8, by - popH - 1) end
+
+                    local popBorder = newObj("Frame", {
+                        Active = true,
+                        BackgroundColor3 = BG_DARK,
+                        BorderSizePixel = 0,
+                        Position = UDim2.new(0, bx, 0, py),
+                        Size = UDim2.new(0, bw, 0, popH),
+                        ZIndex = 60,
+                        Parent = screenGui,
+                    })
+                    myPopFrame = popBorder
+                    local popIn = newObj("Frame", {
+                        BackgroundColor3 = BORDER_LIGHT,
+                        BorderSizePixel = 0,
+                        Position = UDim2.new(0, 1, 0, 1),
+                        Size = UDim2.new(1, -2, 1, -2),
+                        ZIndex = 61,
+                        Parent = popBorder,
+                    })
+                    local popBg = newObj("ScrollingFrame", {
+                        Active = true,
+                        ScrollingEnabled = true,
+                        BackgroundColor3 = BG_POPUP,
+                        BorderSizePixel = 0,
+                        Position = UDim2.new(0, 1, 0, 1),
+                        Size = UDim2.new(1, -2, 1, -2),
+                        CanvasSize = UDim2.new(0, 0, 0, #list * rowH),
+                        ScrollBarThickness = 3,
+                        ScrollBarImageColor3 = accentColor,
+                        ZIndex = 62,
+                        Parent = popIn,
+                    })
+                    local rows = {}
+                    for i = 1, #list do
+                        local optRow = newObj("Frame", {
+                            Active = false,
+                            BackgroundColor3 = BG_POPUP,
+                            BorderSizePixel = 0,
+                            Position = UDim2.new(0, 0, 0, (i - 1) * rowH),
+                            Size = UDim2.new(1, 0, 0, rowH),
+                            ZIndex = 63,
+                            Parent = popBg,
+                        })
+                        newObj("TextLabel", {
+                            BackgroundTransparency = 1,
+                            Position = UDim2.new(0, 6, 0, 0),
+                            Size = UDim2.new(1, -12, 1, 0),
+                            Font = Enum.Font.SourceSans,
+                            Text = tostring(list[i]),
+                            TextColor3 = (i == selIdx) and accentColor or TEXT_NORM,
+                            TextSize = 12,
+                            TextXAlignment = Enum.TextXAlignment.Left,
+                            ZIndex = 64,
+                            Parent = optRow,
+                        })
+                        rows[i] = optRow
+                    end
+                    arrowLbl.Text = "^"
+                    local maxSc = math.max(0, #list * rowH - (popH - 4))
+                    activePopup = {
+                        owner = box, frame = popBorder, scroll = popBg,
+                        x = bx, y = py, w = bw, h = popH,
+                        rowH = rowH, count = #list, rows = rows,
+                        scrollY = 0, lastNativeY = 0, maxScroll = maxSc,
+                        armed = false, openedAt = nowSafe(),
+                        pickFn = function(idx) pick(idx, false); myClose() end,
+                        closeFn = myClose,
+                    }
+                end
+
                 local w = {
-                    kind = "dropdown", name = s, _dispName = utf8Trunc(s, 34, false),
-                    options = list, _dispOpts = dispOpts, selIdx = selIdx,
-                    _dispVal = utf8Trunc(tostring(list[selIdx] or ""), 30, false),
-                    callback = callback, visible = true, _h = 38,
+                    kind = "dropdown", root = holder, visible = true, _h = 38, _relY = 0,
+                    setHover = function(hov) boxFill.BackgroundColor3 = hov and BG_CTRL_HOV or BG_CTRL end,
+                    openAt = openAt,
                 }
                 sec.widgets[#sec.widgets + 1] = w
-                uiDirty = true
+                relayout()
                 return {
-                    get = function() return w.options[w.selIdx] end,
+                    get = function() return list[selIdx] end,
                     set = function(v, silent)
-                        for i = 1, #w.options do
-                            if w.options[i] == v then
-                                if w.selIdx ~= i then
-                                    w.selIdx = i
-                                    w._dispVal = utf8Trunc(tostring(w.options[i] or ""), 30, false)
-                                    uiDirty = true
-                                end
-                                if not silent and w.callback then pcall(w.callback, w.options[w.selIdx]) end
-                                return
-                            end
-                        end
+                        for i = 1, #list do if list[i] == v then pick(i, silent); return end end
                     end,
                     setOptions = function(newOpts, newVal)
-                        if activePopup and activePopup.widget == w then closePopup() end
-                        local nl = (type(newOpts) == "table" and #newOpts > 0) and newOpts or {"None"}
-                        local ndo = {}
-                        for i = 1, #nl do ndo[i] = utf8Trunc(tostring(nl[i] or ""), 31, false) end
-                        w.options, w._dispOpts = nl, ndo
-                        w.selIdx = 1
+                        myClose()
+                        list = (type(newOpts) == "table" and #newOpts > 0) and newOpts or {"None"}
+                        selIdx = 1
                         if newVal ~= nil then
-                            for i = 1, #nl do if nl[i] == newVal then w.selIdx = i; break end end
+                            for i = 1, #list do if list[i] == newVal then selIdx = i; break end end
                         end
-                        w._dispVal = utf8Trunc(tostring(nl[w.selIdx] or ""), 30, false)
-                        uiDirty = true
+                        selLbl.Text = tostring(list[selIdx])
                     end,
-                    setText = function(v)
-                        local nv = tostring(v or "")
-                        if nv ~= w.name then w.name = nv; w._dispName = utf8Trunc(nv, 34, false); uiDirty = true end
-                    end,
+                    setText = function(v) titleLbl.Text = tostring(v or "") end,
                     setVisible = function(vis)
                         vis = vis == true
                         if vis ~= w.visible then
-                            w.visible = vis
-                            if not vis and activePopup and activePopup.widget == w then closePopup() end
-                            uiDirty = true
+                            w.visible = vis; holder.Visible = vis
+                            if not vis then myClose() end
+                            relayout()
                         end
                     end,
                 }
             end
 
             function sec:newTextbox(name, placeholder, default, callback, readOnly)
-                local s = tostring(name or "Input")
-                local ph = tostring(placeholder or "")
-                local def = tostring(default or "")
+                local holder = newObj("Frame", {
+                    Active = false,
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, -6, 0, 38),
+                    Parent = contentScroll,
+                })
+                local titleLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, 0, 0, 14),
+                    Font = Enum.Font.SourceSans,
+                    Text = tostring(name or "Input"),
+                    TextColor3 = TEXT_NORM,
+                    TextSize = 13,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    Parent = holder,
+                })
+                local box = newObj("Frame", {
+                    BackgroundColor3 = BG_DARK,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 0, 0, 16),
+                    Size = UDim2.new(1, 0, 0, 20),
+                    Parent = holder,
+                })
+                local boxIn = newObj("Frame", {
+                    BackgroundColor3 = BORDER_LIGHT,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = box,
+                })
+                local tb = newObj("TextBox", {
+                    Active = true,
+                    BackgroundColor3 = Color3.fromRGB(28, 28, 28),
+                    BorderSizePixel = 0,
+                    ClearTextOnFocus = false,
+                    TextEditable = not readOnly,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Font = Enum.Font.SourceSans,
+                    PlaceholderText = tostring(placeholder or ""),
+                    PlaceholderColor3 = Color3.fromRGB(115, 115, 115),
+                    Text = tostring(default or ""),
+                    TextColor3 = TEXT_BRIGHT,
+                    TextSize = 12,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ClipsDescendants = true,
+                    Parent = boxIn,
+                })
+                newObj("UIPadding", {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5), Parent = tb})
+                local suppress = false
+                track(tb.FocusLost:Connect(function()
+                    if suppress or not uiAlive then return end
+                    if callback then pcall(callback, tb.Text) end
+                end))
                 local w = {
-                    kind = "textbox", name = s, _dispName = utf8Trunc(s, 34, false),
-                    placeholder = ph, _dispPh = utf8Trunc(ph, 32, false),
-                    value = def, _dispVal = utf8Trunc(def, 32, true), _dispCaret = utf8Trunc(def .. "_", 32, true),
-                    callback = callback, readOnly = readOnly == true, visible = true, _h = 38,
+                    kind = "textbox", root = holder, tb = tb, readOnly = readOnly == true,
+                    visible = true, _h = 38, _relY = 0,
                 }
                 sec.widgets[#sec.widgets + 1] = w
-                uiDirty = true
+                relayout()
                 return {
-                    get = function() return w.value end,
+                    get = function() return tb.Text end,
                     set = function(v, silent)
-                        local nv = tostring(v or "")
-                        if nv ~= w.value then
-                            w.value = nv
-                            refreshBoxDisplay(w)
-                        end
-                        if focusedBox == w and bridgeTb then
-                            bridgeSuppress = true
-                            pcall(function() bridgeTb.Text = w.value end)
-                            bridgeSuppress = false
-                        end
-                        if not silent and w.callback then pcall(w.callback, w.value) end
+                        suppress = true
+                        tb.Text = tostring(v or "")
+                        suppress = false
+                        if not silent and callback then pcall(callback, tb.Text) end
                     end,
-                    setText = function(v)
-                        local nv = tostring(v or "")
-                        if nv ~= w.name then w.name = nv; w._dispName = utf8Trunc(nv, 34, false); uiDirty = true end
-                    end,
+                    setText = function(v) titleLbl.Text = tostring(v or "") end,
                     setVisible = function(vis)
                         vis = vis == true
-                        if vis ~= w.visible then
-                            w.visible = vis
-                            if not vis and focusedBox == w then commitFocusedBox() end
-                            uiDirty = true
-                        end
+                        if vis ~= w.visible then w.visible = vis; holder.Visible = vis; relayout() end
                     end,
                 }
             end
 
             function sec:newKeybind(name, defaultKey, callback)
-                local s = tostring(name or "Keybind")
-                local kv = tostring(defaultKey or "RightShift")
-                local ks = "[" .. utf8Trunc(kv, 11, false) .. "]"
+                local keyVal = tostring(defaultKey or "RightShift")
+                local row = newObj("Frame", {
+                    Active = false,
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, -6, 0, 20),
+                    Parent = contentScroll,
+                })
+                local titleLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(0.62, 0, 1, 0),
+                    Font = Enum.Font.SourceSans,
+                    Text = tostring(name or "Keybind"),
+                    TextColor3 = TEXT_NORM,
+                    TextSize = 13,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    Parent = row,
+                })
+                local btn = newObj("Frame", {
+                    Active = false,
+                    BackgroundColor3 = BG_DARK,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0.62, 0, 0, 0),
+                    Size = UDim2.new(0.38, 0, 0, 20),
+                    Parent = row,
+                })
+                local btnIn = newObj("Frame", {
+                    BackgroundColor3 = BORDER_LIGHT,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = btn,
+                })
+                local btnFill = newObj("Frame", {
+                    BackgroundColor3 = BG_CTRL,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = btnIn,
+                })
+                local kLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Size = UDim2.new(1, 0, 1, 0),
+                    Font = Enum.Font.SourceSans,
+                    Text = "[" .. keyVal .. "]",
+                    TextColor3 = accentColor,
+                    TextSize = 12,
+                    Parent = btnFill,
+                })
+                accentUpdaters[#accentUpdaters + 1] = function(c) kLbl.TextColor3 = c end
                 local w = {
-                    kind = "keybind", name = s, _dispName = utf8Trunc(s, 24, false),
-                    value = kv, _kStr = ks, _kW = measureTextW(ks, 11),
-                    callback = callback, visible = true, _h = 18,
+                    kind = "keybind", root = row, visible = true, _h = 20, _relY = 0,
+                    setHover = function(hov) btnFill.BackgroundColor3 = hov and BG_CTRL_HOV or BG_CTRL end,
+                    onClick = function()
+                        closePopup()
+                        if capturingKey then capturingKey.cancel() end
+                        kLbl.Text = "[ ... ]"
+                        capturingKey = {
+                            waitRelease = true,
+                            apply = function(kName)
+                                keyVal = kName
+                                kLbl.Text = "[" .. keyVal .. "]"
+                                if callback then pcall(callback, keyVal) end
+                            end,
+                            cancel = function() kLbl.Text = "[" .. keyVal .. "]" end,
+                        }
+                    end,
                 }
                 sec.widgets[#sec.widgets + 1] = w
-                uiDirty = true
+                relayout()
                 return {
-                    get = function() return w.value end,
+                    get = function() return keyVal end,
                     set = function(v, silent)
-                        local nv = tostring(v or "RightShift")
-                        if nv ~= w.value then
-                            w.value = nv
-                            w._kStr = "[" .. utf8Trunc(nv, 11, false) .. "]"
-                            w._kW = measureTextW(w._kStr, 11)
-                            uiDirty = true
-                        end
-                        if not silent and w.callback then pcall(w.callback, w.value) end
+                        keyVal = tostring(v or "RightShift")
+                        kLbl.Text = "[" .. keyVal .. "]"
+                        if not silent and callback then pcall(callback, keyVal) end
                     end,
-                    setText = function(v)
-                        local nv = tostring(v or "")
-                        if nv ~= w.name then w.name = nv; w._dispName = utf8Trunc(nv, 24, false); uiDirty = true end
-                    end,
+                    setText = function(v) titleLbl.Text = tostring(v or "") end,
                     setVisible = function(vis)
                         vis = vis == true
-                        if vis ~= w.visible then w.visible = vis; uiDirty = true end
+                        if vis ~= w.visible then w.visible = vis; row.Visible = vis; relayout() end
                     end,
                 }
             end
@@ -4059,50 +4382,195 @@ do
 
         function win:addTab(label, iconAsset)
             local idx = #win.tabs + 1
-            local lbl = tostring(label or "Tab")
+            local btn = newObj("Frame", {
+                Active = false,
+                BackgroundColor3 = BG_DARK,
+                BorderSizePixel = 0,
+                Position = UDim2.new(0, 0, 0, (idx - 1) * 64),
+                Size = UDim2.new(0, 73, 0, 64),
+                Parent = tabHolder,
+            })
+            local botBar = newObj("Frame", {
+                BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+                BorderSizePixel = 0,
+                Position = UDim2.new(0, 0, 1, 0),
+                Size = UDim2.new(1, 0, 0, 1),
+                Visible = false,
+                ZIndex = 3,
+                Parent = btn,
+            })
+            newObj("Frame", {
+                BackgroundColor3 = BORDER_LIGHT,
+                BorderSizePixel = 0,
+                Position = UDim2.new(0, 0, 0, -1),
+                Size = UDim2.new(1, 2, 1, 0),
+                ZIndex = 3,
+                Parent = botBar,
+            })
+            local topBar = newObj("Frame", {
+                BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+                BorderSizePixel = 0,
+                Position = UDim2.new(0, 0, 0, -1),
+                Size = UDim2.new(1, 0, 0, 1),
+                Visible = false,
+                ZIndex = 3,
+                Parent = btn,
+            })
+            newObj("Frame", {
+                BackgroundColor3 = BORDER_LIGHT,
+                BorderSizePixel = 0,
+                Position = UDim2.new(0, 0, 0, 1),
+                Size = UDim2.new(1, 2, 1, 0),
+                ZIndex = 3,
+                Parent = topBar,
+            })
+            local sideBar = newObj("Frame", {
+                BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+                BorderSizePixel = 0,
+                Position = UDim2.new(0, 73, 0, 0),
+                Size = UDim2.new(0, 1, 1, 0),
+                Parent = btn,
+            })
+            newObj("Frame", {
+                BackgroundColor3 = BORDER_LIGHT,
+                BorderSizePixel = 0,
+                Position = UDim2.new(1, 0, 0, 0),
+                Size = UDim2.new(0, 1, 1, 0),
+                Parent = sideBar,
+            })
+            local icon = newObj("ImageLabel", {
+                BackgroundTransparency = 1,
+                Position = UDim2.new(0.5, -20, 0, 6),
+                Size = UDim2.new(0, 40, 0, 40),
+                Image = iconAsset or "",
+                ImageColor3 = TAB_IDLE,
+                ScaleType = Enum.ScaleType.Fit,
+                Parent = btn,
+            })
+            local lbl = newObj("TextLabel", {
+                BackgroundTransparency = 1,
+                Position = UDim2.new(0, 2, 0, 47),
+                Size = UDim2.new(1, -4, 0, 14),
+                Font = Enum.Font.SourceSans,
+                Text = tostring(label or "Tab"),
+                TextColor3 = TAB_IDLE,
+                TextSize = 11,
+                Parent = btn,
+            })
+            local frame = newObj("Frame", {
+                BackgroundTransparency = 1,
+                Position = UDim2.new(0, 96, 0, 23),
+                Size = UDim2.new(0, 532, 0, 506),
+                Visible = false,
+                Parent = bg,
+            })
+
+            local totalTabH = idx * 64
+            tabHolder.Size = UDim2.new(0, 73, 0, totalTabH)
+            bottomGap.Position = UDim2.new(0, 0, 0, 18 + totalTabH)
+            bottomGap.Size = UDim2.new(0, 73, 1, -(18 + totalTabH))
+
             local tabObj = {
-                idx = idx, label = lbl, _dispLabel = utf8Trunc(lbl, 10, false),
-                iconImg = makeIconImg(iconAsset),
-                sections = {}, colY = {left = 0, right = 0},
+                idx = idx, button = btn, icon = icon, lbl = lbl,
+                topBar = topBar, botBar = botBar, sideBar = sideBar,
+                frame = frame, sections = {}, colY = {left = 0, right = 0},
             }
-            tabObj.setLabel = function(text)
-                local nt = tostring(text or "")
-                if nt ~= tabObj.label then
-                    tabObj.label = nt
-                    tabObj._dispLabel = utf8Trunc(nt, 10, false)
-                    uiDirty = true
-                end
-            end
+            tabObj.setLabel = function(text) lbl.Text = tostring(text or "") end
+
             function tabObj:newSection(secName, side, scale)
                 local hScale = math.clamp(tonumber(scale) or 1.0, 0.2, 1.0)
                 local isRight = string.lower(tostring(side or "left")) == "right"
                 local yFrac = isRight and tabObj.colY.right or tabObj.colY.left
                 if isRight then tabObj.colY.right = yFrac + hScale else tabObj.colY.left = yFrac + hScale end
-                local ts = tostring(secName or "Section")
-                local dts = utf8Trunc(ts, 30, false)
+
+                local secRelX = isRight and 275 or 0
+                local secRelY = math.floor(yFrac * 506)
+                local secW = 257
+                local secH = math.floor(hScale * 506) - 9
+
+                local secFrame = newObj("Frame", {
+                    Active = false,
+                    BackgroundColor3 = BG_DARK,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, secRelX, 0, secRelY),
+                    Size = UDim2.new(0, secW, 0, secH),
+                    Parent = frame,
+                })
+                local inside = newObj("Frame", {
+                    BackgroundColor3 = BORDER_LIGHT,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = secFrame,
+                })
+                local inside2 = newObj("Frame", {
+                    BackgroundColor3 = BG_PANEL,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(0, 1, 0, 1),
+                    Size = UDim2.new(1, -2, 1, -2),
+                    Parent = inside,
+                })
+                local titleLbl = newObj("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Position = UDim2.new(0, 10, 0, 3),
+                    Size = UDim2.new(1, -20, 0, 16),
+                    Font = Enum.Font.SourceSansBold,
+                    Text = tostring(secName or "Section"),
+                    TextColor3 = TEXT_NORM,
+                    TextSize = 14,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    Parent = inside2,
+                })
+                local viewW = (secW - 4) - 14
+                local viewH = (secH - 4) - 28
+                local scroll = newObj("ScrollingFrame", {
+                    Active = true,
+                    ScrollingEnabled = true,
+                    BackgroundTransparency = 1,
+                    BorderSizePixel = 0,
+                    ClipsDescendants = true,
+                    Position = UDim2.new(0, 10, 0, 22),
+                    Size = UDim2.new(0, viewW, 0, viewH),
+                    CanvasSize = UDim2.new(0, 0, 0, 0),
+                    ScrollBarThickness = 3,
+                    ScrollBarImageColor3 = accentColor,
+                    Parent = inside2,
+                })
+                accentUpdaters[#accentUpdaters + 1] = function(c) scroll.ScrollBarImageColor3 = c end
                 local secObj = {
-                    title = ts, _dispTitle = dts, _titleW = measureTextW(dts, 12),
-                    isRight = isRight, yFrac = yFrac, hScale = hScale,
-                    scrollY = 0, widgets = {},
+                    frame = secFrame, scroll = scroll,
+                    relX = secRelX, relY = secRelY, w = secW, h = secH,
+                    viewOffX = 12, viewOffY = 24, viewW = viewW, viewH = viewH,
+                    scrollY = 0, lastNativeY = 0, totalH = 0, maxScroll = 0,
+                    widgets = {},
+                    setTitle = function(v) titleLbl.Text = tostring(v or "") end,
                 }
-                secObj.setTitle = function(v)
-                    local nt = tostring(v or "")
-                    if nt ~= secObj.title then
-                        secObj.title = nt
-                        secObj._dispTitle = utf8Trunc(nt, 30, false)
-                        secObj._titleW = measureTextW(secObj._dispTitle, 12)
-                        uiDirty = true
-                    end
-                end
-                attachWidgets(secObj)
+                attachWidgets(secObj, scroll)
                 tabObj.sections[#tabObj.sections + 1] = secObj
-                uiDirty = true
                 return secObj
             end
+
             win.tabs[idx] = tabObj
-            if idx == 1 then win.activeTab = 1 end
-            uiDirty = true
+            if idx == 1 then win:setActiveTab(1) end
             return tabObj
+        end
+
+        local function syncSectionScroll(sec)
+            local okN, ny = pcall(function() return sec.scroll.CanvasPosition.Y end)
+            if okN and finite(ny) and math.abs(ny - sec.lastNativeY) >= 1 then
+                sec.scrollY = math.clamp(ny, 0, sec.maxScroll)
+                sec.lastNativeY = sec.scrollY
+                closePopup()
+            end
+        end
+
+        local function setSectionScroll(sec, ny)
+            local clamped = math.clamp(ny, 0, sec.maxScroll)
+            if math.abs(clamped - sec.scrollY) < 0.5 then return end
+            sec.scrollY = clamped
+            sec.lastNativeY = clamped
+            pcall(function() sec.scroll.CanvasPosition = Vector2.new(0, clamped) end)
+            closePopup()
         end
 
         local function stepKeyCapture(now)
@@ -4121,321 +4589,75 @@ do
                 local target = capturingKey
                 capturingKey = nil
                 ignoreToggleUntil = now + 0.30
-                uiDirty = true
                 if picked == "Escape" then target.cancel() else target.apply(picked) end
             end
         end
 
-        local function stepTextInput(now)
-            if not focusedBox then return end
-            local bridgeActive = false
-            if uis and bridgeTb then
-                local okF, f = pcall(function() return uis:GetFocusedTextBox() end)
-                if okF and f == bridgeTb then bridgeActive = true end
-            end
-            if bridgeActive then return end
-
-            local ctrl = isKeyDownSafe("LeftControl") or isKeyDownSafe("RightControl")
-            local shift = isKeyDownSafe("LeftShift") or isKeyDownSafe("RightShift")
-
-            if isKeyDownSafe("Escape") or isKeyDownSafe("Return") then
-                ignoreToggleUntil = now + 0.20
-                commitFocusedBox()
+        local function updateHover(mx, my)
+            -- Popup hover
+            if activePopup then
+                local pop = activePopup
+                local newPop = nil
+                if inRect(mx, my, pop.x + 2, pop.y + 2, pop.w - 4, pop.h - 4) then
+                    local okN, ny = pcall(function() return pop.scroll.CanvasPosition.Y end)
+                    if okN and finite(ny) then pop.scrollY = ny end
+                    local idx = math.floor((my - (pop.y + 2) + pop.scrollY) / pop.rowH) + 1
+                    if idx >= 1 and idx <= pop.count then newPop = idx end
+                end
+                if newPop ~= hoveredPopIdx then
+                    if hoveredPopIdx and pop.rows[hoveredPopIdx] then pop.rows[hoveredPopIdx].BackgroundColor3 = BG_POPUP end
+                    hoveredPopIdx = newPop
+                    if newPop and pop.rows[newPop] then pop.rows[newPop].BackgroundColor3 = BG_CTRL_HOV end
+                end
                 return
             end
-            if ctrl then
-                local vDown = isKeyDownSafe("V")
-                if vDown and not typePrev._v and not focusedBox.readOnly and type(getclipboard) == "function" then
-                    local ok, clip = pcall(getclipboard)
-                    if ok and type(clip) == "string" then
-                        focusedBox.value = (focusedBox.value .. clip):sub(1, 2048)
-                        refreshBoxDisplay(focusedBox)
-                    end
-                end
-                typePrev._v = vDown
-                local cDown = isKeyDownSafe("C")
-                if cDown and not typePrev._c and type(setclipboard) == "function" then
-                    pcall(setclipboard, focusedBox.value)
-                end
-                typePrev._c = cDown
-                return
-            end
-            typePrev._v, typePrev._c = false, false
 
-            if focusedBox.readOnly then return end
-
-            local bsDown = isKeyDownSafe("Backspace")
-            if bsDown then
-                if not typePrev._bs then
-                    focusedBox.value = utf8Pop(focusedBox.value)
-                    refreshBoxDisplay(focusedBox)
-                    bkspHoldAt = now + 0.35
-                elseif now >= bkspHoldAt then
-                    focusedBox.value = utf8Pop(focusedBox.value)
-                    refreshBoxDisplay(focusedBox)
-                    bkspHoldAt = now + 0.05
+            -- Tabs hover
+            local bgX, bgY = winX + 5, winY + 5
+            local newTab = nil
+            for i = 1, #win.tabs do
+                if win.activeTab ~= i and inRect(mx, my, bgX, bgY + 18 + (i - 1) * 64, 73, 64) then
+                    newTab = i; break
                 end
             end
-            typePrev._bs = bsDown
-
-            local delDown = isKeyDownSafe("Delete")
-            if delDown and not typePrev._del then
-                focusedBox.value = ""
-                refreshBoxDisplay(focusedBox)
-            end
-            typePrev._del = delDown
-
-            for i = 1, #TYPE_KEYS do
-                local k = TYPE_KEYS[i]
-                local d = isKeyDownSafe(k)
-                if d and not typePrev[k] and #focusedBox.value < 512 then
-                    local pair = TYPE_MAP[k]
-                    focusedBox.value = focusedBox.value .. (shift and pair[2] or pair[1])
-                    refreshBoxDisplay(focusedBox)
+            if newTab ~= hoveredTabIdx then
+                if hoveredTabIdx and win.tabs[hoveredTabIdx] and win.activeTab ~= hoveredTabIdx then
+                    win.tabs[hoveredTabIdx].icon.ImageColor3 = TAB_IDLE
+                    win.tabs[hoveredTabIdx].lbl.TextColor3 = TAB_IDLE
                 end
-                typePrev[k] = d
-            end
-        end
-
-        local function renderSection(sec, secX, secY, secW, secH, mx, my, now, canClick, wheel, blockMain)
-            drawBox3(secX, secY, secW, secH, BG_PANEL, 20, BORDER_LIGHT)
-            drawRect(secX + 10, secY, math.min(secW - 22, sec._titleW + 10), 2, BG_PANEL, 23)
-            drawText(secX + 15, secY - 6, sec._dispTitle, TEXT_BRIGHT, 12, 24, false, true)
-
-            local viewX = secX + 12
-            local viewY = secY + 16
-            local viewW = secW - 24
-            local viewH = secH - 24
-            local viewBot = viewY + viewH
-
-            local totalH = 0
-            for i = 1, #sec.widgets do
-                local w = sec.widgets[i]
-                if w.visible then totalH = totalH + w._h + 6 end
-            end
-            local maxScroll = math.max(0, totalH - viewH)
-
-            local hoveredSec = inRect(mx, my, secX, secY, secW, secH)
-            if not blockMain and hoveredSec and maxScroll > 0 then
-                if wheel ~= 0 then sec.scrollY = sec.scrollY - wheel * 36 end
-                if isKeyDownSafe("Down") then sec.scrollY = sec.scrollY + 8; uiDirty = true end
-                if isKeyDownSafe("Up") then sec.scrollY = sec.scrollY - 8; uiDirty = true end
-            end
-            sec.scrollY = math.clamp(sec.scrollY, 0, maxScroll)
-
-            local consumed = false
-            if maxScroll > 0 then
-                local sbX = secX + secW - 7
-                local sbY = viewY
-                local sbH = viewH
-                local thumbH = math.max(22, math.floor(sbH * (viewH / math.max(1, totalH))))
-                local thumbY = sbY + math.floor((sec.scrollY / maxScroll) * (sbH - thumbH))
-                drawRect(sbX, sbY, 3, sbH, SCROLL_TRACK, 23)
-                drawRect(sbX, thumbY, 3, thumbH, SCROLL_THUMB, 24)
-                if not blockMain and canClick and inRect(mx, my, sbX - 4, sbY, 11, sbH) then
-                    activeScrollDrag = {sec = sec, sbY = sbY, sbH = sbH, thumbH = thumbH, maxScroll = maxScroll}
-                    local f = math.clamp((my - sbY - thumbH * 0.5) / math.max(1, sbH - thumbH), 0, 1)
-                    sec.scrollY = f * maxScroll
-                    lastClickAt = now
-                    consumed = true
+                hoveredTabIdx = newTab
+                if newTab and win.tabs[newTab] then
+                    win.tabs[newTab].icon.ImageColor3 = TAB_HOV
+                    win.tabs[newTab].lbl.TextColor3 = TAB_HOV
                 end
             end
 
-            local inView = (not blockMain) and inRect(mx, my, viewX, viewY, viewW, viewH)
-            local curY = viewY - sec.scrollY
-            for i = 1, #sec.widgets do
-                local w = sec.widgets[i]
-                if w.visible then
-                    local wh = w._h
-                    local y0, y1 = curY, curY + wh
-                    curY = curY + wh + 6
-
-                    if y0 >= viewY - 2 and y1 <= viewBot + 2 then
-                        if w.kind == "label" then
-                            local lines = w._lines
-                            for li = 1, #lines do
-                                drawText(viewX, y0 + (li - 1) * 14, lines[li], w.col or TEXT_NORM, 12, 29, false, false)
-                            end
-
-                        elseif w.kind == "toggle" then
-                            local hov = inView and inRect(mx, my, viewX, y0, viewW, wh)
-                            drawRect(viewX, y0 + 3, 10, 10, BG_BLACK, 25)
-                            drawRect(viewX + 1, y0 + 4, 8, 8, w.value and accentColor or (hov and CHECK_HOV or CHECK_OFF), 28)
-                            drawText(viewX + 18, y0 + 1, w._dispName, w.value and TEXT_BRIGHT or TEXT_NORM, 12, 29, false, false)
-                            if canClick and not consumed and hov then
-                                w.value = not w.value
-                                lastClickAt = now
-                                consumed = true
-                                uiDirty = true
-                                if w.callback then pcall(w.callback, w.value) end
-                            end
-
-                        elseif w.kind == "button" then
-                            local hov = inView and inRect(mx, my, viewX, y0, viewW, 22)
-                            local bgc = (now < w.flashUntil) and BG_CTRL_ACT or (hov and BG_CTRL_HOV or BG_CTRL)
-                            drawBox3(viewX, y0, viewW, 22, bgc, 25, hov and BORDER_HOV or BORDER_LIGHT)
-                            drawText(viewX + viewW * 0.5, y0 + 4, w._dispName, hov and TEXT_BRIGHT or TEXT_NORM, 12, 29, true, false)
-                            if canClick and not consumed and hov then
-                                w.flashUntil = now + 0.12
-                                flashActiveUntil = math.max(flashActiveUntil, w.flashUntil + 0.03)
-                                lastClickAt = now
-                                consumed = true
-                                uiDirty = true
-                                if w.callback then pcall(w.callback) end
-                            end
-
-                        elseif w.kind == "slider" then
-                            drawText(viewX, y0, w._dispName, TEXT_NORM, 12, 29, false, false)
-                            drawText(viewX + viewW - w._valW, y0 + 1, w._valStr, TEXT_BRIGHT, 11, 29, false, false)
-                            local ty = y0 + 17
-                            drawRect(viewX, ty, viewW, 8, BG_BLACK, 25)
-                            drawRect(viewX + 1, ty + 1, viewW - 2, 6, BG_TRACK, 27)
-                            local frac = math.clamp((w.value - w.minVal) / math.max(1, w.maxVal - w.minVal), 0, 1)
-                            local fw = math.floor((viewW - 2) * frac + 0.5)
-                            if fw > 0 then drawRect(viewX + 1, ty + 1, fw, 6, accentColor, 28) end
-                            if canClick and not consumed and inView and inRect(mx, my, viewX, ty - 4, viewW, 16) then
-                                activeSlider = {widget = w, x = viewX + 1, w = viewW - 2}
-                                local a = math.clamp((mx - (viewX + 1)) / math.max(1, viewW - 2), 0, 1)
-                                local nv = roundInt(math.clamp(w.minVal + a * (w.maxVal - w.minVal), w.minVal, w.maxVal))
-                                if nv ~= w.value then
-                                    w.value = nv
-                                    w._valStr = tostring(nv) .. w.suffix
-                                    w._valW = measureTextW(w._valStr, 11)
-                                    if w.callback then pcall(w.callback, nv) end
-                                end
-                                lastClickAt = now
-                                consumed = true
-                                uiDirty = true
-                            end
-
-                        elseif w.kind == "dropdown" then
-                            drawText(viewX, y0, w._dispName, TEXT_NORM, 12, 29, false, false)
-                            local by = y0 + 16
-                            local hov = inView and inRect(mx, my, viewX, by, viewW, 20)
-                            local isMine = activePopup and activePopup.widget == w
-                            drawBox3(viewX, by, viewW, 20, hov and BG_CTRL_HOV or BG_CTRL, 25, isMine and BORDER_HOV or BORDER_LIGHT)
-                            drawText(viewX + 6, by + 3, w._dispVal, TEXT_NORM, 12, 29, false, false)
-                            drawText(viewX + viewW - 12, by + 4, isMine and "^" or "v", TEXT_DIM, 10, 29, false, false)
-                            if canClick and not consumed and hov then
-                                if isMine then
-                                    closePopup()
-                                else
-                                    activePopup = {
-                                        widget = w, x = viewX, y = by + 21, ownerY = by,
-                                        w = viewW, scroll = 0, armed = false, openedAt = now,
-                                    }
-                                end
-                                lastClickAt = now
-                                consumed = true
-                                uiDirty = true
-                            end
-
-                        elseif w.kind == "textbox" then
-                            drawText(viewX, y0, w._dispName, TEXT_NORM, 12, 29, false, false)
-                            local by = y0 + 16
-                            local isFoc = (focusedBox == w)
-                            local hov = inView and inRect(mx, my, viewX, by, viewW, 20)
-                            drawBox3(viewX, by, viewW, 20, BG_INPUT, 25, isFoc and accentColor or BORDER_LIGHT)
-                            local showStr, tcol
-                            if w.value == "" and not isFoc then
-                                showStr, tcol = w._dispPh, TEXT_DIM
-                            else
-                                showStr = (isFoc and (math.floor(now * 2) % 2 == 0)) and w._dispCaret or w._dispVal
-                                tcol = TEXT_BRIGHT
-                            end
-                            drawText(viewX + 6, by + 3, showStr, tcol, 12, 29, false, false)
-                            if isFoc then focusBoxRect = {x = viewX, y = by, w = viewW, h = 20} end
-                            if canClick and not consumed and hov then
-                                focusBox(w, {x = viewX, y = by, w = viewW, h = 20})
-                                lastClickAt = now
-                                consumed = true
-                            end
-
-                        elseif w.kind == "keybind" then
-                            local isCap = capturingKey and capturingKey.widget == w
-                            local kTxt = isCap and "[...]" or w._kStr
-                            local kW = isCap and 26 or w._kW
-                            local hitW = math.max(46, kW + 8)
-                            local hov = inView and inRect(mx, my, viewX + viewW - hitW, y0, hitW, 18)
-                            drawText(viewX, y0 + 2, w._dispName, TEXT_NORM, 12, 29, false, false)
-                            drawText(viewX + viewW - kW, y0 + 3, kTxt, isCap and accentColor or (hov and TEXT_BRIGHT or TEXT_DIM), 11, 29, false, false)
-                            if canClick and not consumed and hov then
-                                closePopup()
-                                if capturingKey then capturingKey.cancel() end
-                                capturingKey = {
-                                    widget = w, waitRelease = true,
-                                    apply = function(kName)
-                                        w.value = kName
-                                        w._kStr = "[" .. utf8Trunc(kName, 11, false) .. "]"
-                                        w._kW = measureTextW(w._kStr, 11)
-                                        uiDirty = true
-                                        if w.callback then pcall(w.callback, w.value) end
-                                    end,
-                                    cancel = function() uiDirty = true end,
-                                }
-                                lastClickAt = now
-                                consumed = true
-                                uiDirty = true
+            -- Active tab widget hover
+            local newW = nil
+            local at = win.tabs[win.activeTab]
+            if at then
+                local tfX, tfY = bgX + 96, bgY + 23
+                for s = 1, #at.sections do
+                    local sec = at.sections[s]
+                    local vx = tfX + sec.relX + sec.viewOffX
+                    local vy = tfY + sec.relY + sec.viewOffY
+                    if inRect(mx, my, vx, vy, sec.viewW - 6, sec.viewH) then
+                        local localY = (my - vy) + sec.scrollY
+                        for k = 1, #sec.widgets do
+                            local w = sec.widgets[k]
+                            if w.visible and w.setHover and localY >= w._relY and localY <= w._relY + w._h then
+                                newW = w; break
                             end
                         end
+                        break
                     end
                 end
             end
-
-            return consumed
-        end
-
-        local function renderPopup(mx, my, now, canClick, wheel)
-            local pop = activePopup
-            if not pop then return false end
-            local w = pop.widget
-            local list = w.options or {}
-            local dlist = w._dispOpts or {}
-            local rowH = 19
-            local maxRows = math.min(#list, 10)
-            local popH = maxRows * rowH + 4
-            local _, curH = getScreen()
-            local py = pop.y
-            if py + popH > curH - 8 then py = math.max(8, pop.ownerY - popH - 1) end
-            local maxSc = math.max(0, #list - maxRows)
-            if maxSc > 0 and wheel ~= 0 and inRect(mx, my, pop.x, py, pop.w, popH) then
-                pop.scroll = math.clamp(pop.scroll - (wheel > 0 and 1 or -1), 0, maxSc)
+            if newW ~= hoveredWidget then
+                if hoveredWidget and hoveredWidget.setHover then hoveredWidget.setHover(false) end
+                hoveredWidget = newW
+                if newW and newW.setHover then newW.setHover(true) end
             end
-
-            drawBox3(pop.x, py, pop.w, popH, BG_POPUP, 50, BORDER_LIGHT)
-            for vi = 1, maxRows do
-                local idx = vi + pop.scroll
-                local ry = py + 2 + (vi - 1) * rowH
-                local hov = inRect(mx, my, pop.x + 2, ry, pop.w - 4, rowH)
-                if hov then drawRect(pop.x + 2, ry, pop.w - 4, rowH, BG_CTRL_HOV, 53) end
-                local isSel = (idx == w.selIdx)
-                drawText(pop.x + 7, ry + 3, dlist[idx] or tostring(list[idx] or ""), isSel and accentColor or (hov and TEXT_BRIGHT or TEXT_NORM), 12, 54, false, false)
-                if pop.armed and canClick and hov then
-                    w.selIdx = idx
-                    w._dispVal = utf8Trunc(tostring(list[idx] or ""), 30, false)
-                    closePopup()
-                    lastClickAt = now
-                    uiDirty = true
-                    if w.callback then pcall(w.callback, list[idx]) end
-                    return true
-                end
-            end
-
-            if maxSc > 0 then
-                local sbX = pop.x + pop.w - 6
-                local sbH = popH - 4
-                local th = math.max(16, math.floor(sbH * (maxRows / #list)))
-                local ty = py + 2 + math.floor((pop.scroll / maxSc) * (sbH - th))
-                drawRect(sbX, ty, 3, th, SCROLL_THUMB, 54)
-            end
-
-            if pop.armed and canClick then
-                if not inRect(mx, my, pop.x, py, pop.w, popH) then closePopup() end
-                lastClickAt = now
-                uiDirty = true
-                return true
-            end
-            return false
         end
 
         function win:step()
@@ -4446,7 +4668,7 @@ do
 
             local tkDown = isKeyDownSafe(win.toggleKey)
             if tkDown and not prevToggleDown then
-                if not capturingKey and not focusedBox and not isChatTyping(bridgeTb) and now >= ignoreToggleUntil then
+                if not capturingKey and not isTyping() and now >= ignoreToggleUntil then
                     ignoreToggleUntil = now + 0.25
                     win:toggle()
                 end
@@ -4468,7 +4690,11 @@ do
             end
 
             local mx, my = getPointerXY()
-            updateCursorDot(mx, my, true)
+            local cx, cy = math.floor(mx - 3.5 + 0.5), math.floor(my - 3.5 + 0.5)
+            if cx ~= curDotX or cy ~= curDotY then
+                curDotX, curDotY = cx, cy
+                curDot.Position = UDim2.new(0, cx, 0, cy)
+            end
 
             local downNow = pollDown()
             local apiJust = false
@@ -4488,12 +4714,10 @@ do
             uisWheelAccum = 0
 
             if not downNow then
-                if activeSlider or activeScrollDrag then uiDirty = true end
                 activeSlider = nil
                 activeScrollDrag = nil
                 if dragWin then
                     dragWin = nil
-                    uiDirty = true
                     if win.onPositionSaved then pcall(win.onPositionSaved, winX, winY) end
                 end
                 if activePopup and not activePopup.armed and (now - activePopup.openedAt) >= 0.05 then
@@ -4501,179 +4725,159 @@ do
                 end
             end
 
+            -- Active drags
             if activeSlider and downNow then
-                local sl = activeSlider
-                local a = math.clamp((mx - sl.x) / math.max(1, sl.w), 0, 1)
-                local nv = roundInt(math.clamp(sl.widget.minVal + a * (sl.widget.maxVal - sl.widget.minVal), sl.widget.minVal, sl.widget.maxVal))
-                if nv ~= sl.widget.value then
-                    sl.widget.value = nv
-                    sl.widget._valStr = tostring(nv) .. sl.widget.suffix
-                    sl.widget._valW = measureTextW(sl.widget._valStr, 11)
-                    uiDirty = true
-                    if sl.widget.callback then pcall(sl.widget.callback, nv) end
-                end
+                activeSlider.applyX(mx, activeSlider.x, activeSlider.w)
+                return
             elseif activeScrollDrag and downNow then
                 local sd = activeScrollDrag
-                local f = math.clamp((my - sd.sbY - sd.thumbH * 0.5) / math.max(1, sd.sbH - sd.thumbH), 0, 1)
-                local nsy = f * sd.maxScroll
-                if math.abs(nsy - sd.sec.scrollY) >= 0.5 then
-                    sd.sec.scrollY = nsy
-                    uiDirty = true
-                end
+                local f = math.clamp((my - sd.vy) / math.max(1, sd.vh), 0, 1)
+                setSectionScroll(sd.sec, f * sd.sec.maxScroll)
+                return
             elseif dragWin and downNow then
                 local curW, curH = getScreen()
                 local nx = math.clamp(dragWin.wx + (mx - dragWin.sx), 0, math.max(0, curW - winW))
                 local ny = math.clamp(dragWin.wy + (my - dragWin.sy), 0, math.max(0, curH - winH))
                 if nx ~= winX or ny ~= winY then
                     winX, winY = nx, ny
-                    uiDirty = true
+                    border.Position = UDim2.new(0, winX, 0, winY)
                 end
+                return
             end
 
-            local canClick = justPressed and (now - lastClickAt) >= 0.11 and (not activeSlider) and (not activeScrollDrag) and (not dragWin)
-
-            if focusedBox then
-                if canClick and focusBoxRect and not inRect(mx, my, focusBoxRect.x, focusBoxRect.y, focusBoxRect.w, focusBoxRect.h) then
-                    commitFocusedBox()
-                else
-                    stepTextInput(now)
-                end
-                local blink = math.floor(now * 2) % 2
-                if blink ~= prevCaretBlink then prevCaretBlink = blink; uiDirty = true end
-            end
-
-            -- Event-driven dirty gate: idle frames skip the full widget render completely
-            local mouseMoved = (mx ~= prevMx or my ~= prevMy)
-            if mouseMoved then
-                prevMx, prevMy = mx, my
-                if now >= nextHoverAt and (activePopup ~= nil or inRect(mx, my, winX - 6, winY - 6, winW + 12, winH + 12)) then
-                    nextHoverAt = now + 0.05
-                    uiDirty = true
-                end
-            end
-            if canClick or wheel ~= 0 then uiDirty = true end
-            if not uiDirty and inRect(mx, my, winX, winY, winW, winH) and (isKeyDownSafe("Down") or isKeyDownSafe("Up")) then
-                uiDirty = true
-            end
-            if flashActiveUntil > 0 and now >= flashActiveUntil then
-                flashActiveUntil = 0
-                uiDirty = true
-            end
-            if not uiDirty then return end
-            uiDirty = false
-
-            beginFrame()
-
-            -- 1. Pure Gamesense 6px multi-layer frame bevel (reduced object count via BorderColor)
-            if hasBorderColor then
-                drawRect(winX, winY, winW, winH, BG_BEVEL_MID, 10, BG_BLACK)
-                drawRect(winX + 1, winY + 1, winW - 2, winH - 2, BG_BEVEL_MID, 12, BG_BEVEL_OUT)
-                drawRect(winX + 5, winY + 5, winW - 10, winH - 10, BG_MAIN, 15, BG_BEVEL_OUT)
-            else
-                drawRect(winX, winY, winW, winH, BG_BLACK, 10)
-                drawRect(winX + 1, winY + 1, winW - 2, winH - 2, BG_BEVEL_OUT, 11)
-                drawRect(winX + 2, winY + 2, winW - 4, winH - 4, BG_BEVEL_MID, 12)
-                drawRect(winX + 4, winY + 4, winW - 8, winH - 8, BG_BEVEL_OUT, 13)
-                drawRect(winX + 5, winY + 5, winW - 10, winH - 10, BG_BLACK, 14)
-                drawRect(winX + 6, winY + 6, winW - 12, winH - 12, BG_MAIN, 15)
-            end
-
-            -- 2. Smooth 2px Gamesense rainbow gradient bar (2 GPU Gradient rects) + 1px dark shadow
-            local rbX, rbY, rbW = winX + 6, winY + 6, winW - 12
-            if useGpuRainbow and rbLeft and rbRight then
-                local halfW = math.floor(rbW * 0.5)
-                local cL = getCache(rbLeft)
-                if cL.x ~= rbX or cL.y ~= rbY then rbLeft.Position = vec2(rbX, rbY); cL.x, cL.y = rbX, rbY end
-                if cL.w ~= halfW then rbLeft.Size = vec2(halfW, 2); cL.w = halfW end
-                if not cL.vis then rbLeft.Visible = true; cL.vis = true end
-                local cR = getCache(rbRight)
-                local rx2, rw2 = rbX + halfW, rbW - halfW
-                if cR.x ~= rx2 or cR.y ~= rbY then rbRight.Position = vec2(rx2, rbY); cR.x, cR.y = rx2, rbY end
-                if cR.w ~= rw2 then rbRight.Size = vec2(rw2, 2); cR.w = rw2 end
-                if not cR.vis then rbRight.Visible = true; cR.vis = true end
-            else
-                local segN = #RB_FALLBACK
-                local segW = math.ceil(rbW / segN)
-                for i = 1, segN do
-                    local sx = rbX + (i - 1) * segW
-                    local swi = math.min(segW, rbX + rbW - sx)
-                    if swi > 0 then drawRect(sx, rbY, swi, 2, RB_FALLBACK[i], 16) end
-                end
-            end
-            drawRect(rbX, rbY + 2, rbW, 1, BG_SHADOW, 16)
-
-            -- 3. Classic 73px Skeet left sidebar (#0c0c0c + black/#282828 right edge)
-            local sbX, sbY, sbH = winX + 6, winY + 9, winH - 15
-            drawRect(sbX, sbY, sideW, sbH, BG_SIDE, 16)
-            drawRect(sbX + sideW, sbY, 1, sbH, BG_PURE_BLK, 17)
-            drawRect(sbX + sideW + 1, sbY, 1, sbH, BORDER_LIGHT, 17)
-
-            -- 4. Pure Skeet tabs (73x64 each, white active icon, seamless cutout)
-            local consumed = false
-            local tabY0, tabH = sbY + 14, 64
-            for i = 1, #win.tabs do
-                local t = win.tabs[i]
-                local ty = tabY0 + (i - 1) * tabH
-                local isAct = (win.activeTab == i)
-                local hov = (not activePopup) and inRect(mx, my, sbX, ty, sideW, tabH)
-                if isAct then
-                    drawRect(sbX, ty, sideW + 2, tabH, BG_MAIN, 17)
-                    drawRect(sbX, ty - 1, sideW + 2, 1, BG_PURE_BLK, 18)
-                    drawRect(sbX, ty, sideW + 2, 1, BORDER_LIGHT, 18)
-                    drawRect(sbX, ty + tabH - 1, sideW + 2, 1, BORDER_LIGHT, 18)
-                    drawRect(sbX, ty + tabH, sideW + 2, 1, BG_PURE_BLK, 18)
-                end
-
-                local iconCol = isAct and TAB_ACT or (hov and TAB_HOV or TAB_IDLE)
-                local drewIcon = drawIcon(t.iconImg, sbX + (sideW - 40) * 0.5, ty + 6, 40, 40, iconCol, 18)
-                if drewIcon then
-                    drawText(sbX + sideW * 0.5, ty + 48, t._dispLabel, iconCol, 10, 18, true, false)
-                else
-                    drawText(sbX + sideW * 0.5, ty + 26, t._dispLabel, iconCol, 11, 18, true, isAct)
-                end
-
-                if not activePopup and canClick and not consumed and hov then
-                    lastClickAt = now
-                    consumed = true
-                    if not isAct then win:setActiveTab(i) end
-                end
-            end
-
-            -- 5. Active tab sections (pure Skeet 2-column groupboxes)
-            local contentX = winX + sideW + 24
-            local contentY = winY + 25
-            local contentW = winW - sideW - 38
-            local contentH = winH - 41
-            local colGap = 15
-            local colW = math.floor((contentW - colGap) * 0.5)
-            local clickedInScrollArea = false
-
+            -- Sync native scroll & handle wheel / keyboard scroll
+            local bgX, bgY = winX + 5, winY + 5
+            local tfX, tfY = bgX + 96, bgY + 23
             local at = win.tabs[win.activeTab]
-            if at then
-                for i = 1, #at.sections do
-                    local sec = at.sections[i]
-                    local sx = sec.isRight and (contentX + colW + colGap) or contentX
-                    local sy = contentY + math.floor(sec.yFrac * contentH)
-                    local sh0 = math.floor(sec.hScale * contentH) - ((sec.yFrac + sec.hScale < 0.99) and 10 or 0)
-                    if inRect(mx, my, sx, sy + 12, colW, sh0 - 12) then clickedInScrollArea = true end
-                    local c = renderSection(sec, sx, sy, colW, sh0, mx, my, now, canClick and not consumed, wheel, activePopup ~= nil)
-                    if c then consumed = true end
+            if activePopup then
+                if wheel ~= 0 and activePopup.maxScroll > 0 and inRect(mx, my, activePopup.x, activePopup.y, activePopup.w, activePopup.h) then
+                    activePopup.scrollY = math.clamp(activePopup.scrollY - wheel * 30, 0, activePopup.maxScroll)
+                    pcall(function() activePopup.scroll.CanvasPosition = Vector2.new(0, activePopup.scrollY) end)
+                end
+            elseif at then
+                for s = 1, #at.sections do
+                    local sec = at.sections[s]
+                    syncSectionScroll(sec)
+                    if sec.maxScroll > 0 then
+                        local sx, sy = tfX + sec.relX, tfY + sec.relY
+                        if inRect(mx, my, sx, sy, sec.w, sec.h) then
+                            if wheel ~= 0 then setSectionScroll(sec, sec.scrollY - wheel * 36) end
+                            if isKeyDownSafe("Down") then setSectionScroll(sec, sec.scrollY + 8) end
+                            if isKeyDownSafe("Up") then setSectionScroll(sec, sec.scrollY - 8) end
+                        end
+                    end
                 end
             end
 
-            -- 6. Floating dropdown popup
-            if activePopup then
-                if renderPopup(mx, my, now, canClick, wheel) then consumed = true end
+            -- Throttled hover update when mouse moves
+            if (mx ~= prevMx or my ~= prevMy) and now >= nextHoverAt then
+                prevMx, prevMy = mx, my
+                nextHoverAt = now + 0.04
+                updateHover(mx, my)
             end
 
-            -- 7. Window dragging (outer margins, top border, empty sidebar, groupbox headers)
-            if not activePopup and canClick and not consumed and not clickedInScrollArea and inRect(mx, my, winX, winY, winW, winH) then
+            -- Click handling (pure exact-math hit-testing in ScreenGui coords)
+            if not justPressed or (now - lastClickAt) < 0.11 then return end
+
+            -- 1. Active dropdown popup has top priority
+            if activePopup then
+                if activePopup.armed then
+                    local pop = activePopup
+                    if inRect(mx, my, pop.x + 2, pop.y + 2, pop.w - 4, pop.h - 4) then
+                        local okN, ny = pcall(function() return pop.scroll.CanvasPosition.Y end)
+                        if okN and finite(ny) then pop.scrollY = ny end
+                        local idx = math.floor((my - (pop.y + 2) + pop.scrollY) / pop.rowH) + 1
+                        if idx >= 1 and idx <= pop.count then
+                            lastClickAt = now
+                            pop.pickFn(idx)
+                            return
+                        end
+                    end
+                    closePopup()
+                    lastClickAt = now
+                end
+                return
+            end
+
+            -- 2. Sidebar tabs (exact 73x64 slots at bgX, bgY + 18 + (i-1)*64)
+            for i = 1, #win.tabs do
+                if inRect(mx, my, bgX, bgY + 18 + (i - 1) * 64, 73, 64) then
+                    lastClickAt = now
+                    if win.activeTab ~= i then win:setActiveTab(i) end
+                    return
+                end
+            end
+
+            -- 3. Active tab sections & widgets
+            local clickedInsideScroll = false
+            if at then
+                for s = 1, #at.sections do
+                    local sec = at.sections[s]
+                    local vx = tfX + sec.relX + sec.viewOffX
+                    local vy = tfY + sec.relY + sec.viewOffY
+                    if inRect(mx, my, vx, vy, sec.viewW, sec.viewH) then
+                        clickedInsideScroll = true
+                        -- Scrollbar drag zone (right 10px when scrollable)
+                        if sec.maxScroll > 0 and mx >= vx + sec.viewW - 10 then
+                            activeScrollDrag = {sec = sec, vy = vy, vh = sec.viewH}
+                            local f = math.clamp((my - vy) / math.max(1, sec.viewH), 0, 1)
+                            setSectionScroll(sec, f * sec.maxScroll)
+                            lastClickAt = now
+                            return
+                        end
+                        local localY = (my - vy) + sec.scrollY
+                        local itemW = sec.viewW - 6
+                        for k = 1, #sec.widgets do
+                            local w = sec.widgets[k]
+                            if w.visible and localY >= w._relY and localY <= w._relY + w._h then
+                                if w.kind == "textbox" then
+                                    if localY >= w._relY + 14 then
+                                        lastClickAt = now
+                                        if w.readOnly and type(setclipboard) == "function" and #w.tb.Text > 0 then
+                                            pcall(setclipboard, w.tb.Text)
+                                        end
+                                        local okF, curF = pcall(function() return uis and uis:GetFocusedTextBox() end)
+                                        if not (okF and curF == w.tb) then
+                                            pcall(function() w.tb:CaptureFocus() end)
+                                        end
+                                        return
+                                    end
+                                elseif w.kind == "slider" then
+                                    if localY >= w._relY + 12 then
+                                        releaseFocusedTextBox()
+                                        activeSlider = {applyX = w.applyX, x = vx + 1, w = itemW - 2}
+                                        w.applyX(mx, vx + 1, itemW - 2)
+                                        lastClickAt = now
+                                        return
+                                    end
+                                elseif w.kind == "dropdown" then
+                                    if localY >= w._relY + 14 then
+                                        releaseFocusedTextBox()
+                                        local boxScreenY = vy + (w._relY - sec.scrollY) + 16
+                                        w.openAt(vx, boxScreenY, itemW)
+                                        lastClickAt = now
+                                        return
+                                    end
+                                elseif w.onClick then
+                                    releaseFocusedTextBox()
+                                    lastClickAt = now
+                                    w.onClick()
+                                    return
+                                end
+                            end
+                        end
+                        releaseFocusedTextBox()
+                        return
+                    end
+                end
+            end
+
+            -- 4. Window dragging (anywhere on window frame/top/sidebar/section headers outside scroll areas)
+            if not clickedInsideScroll and inRect(mx, my, winX, winY, winW, winH) then
+                releaseFocusedTextBox()
                 dragWin = {sx = mx, sy = my, wx = winX, wy = winY}
                 lastClickAt = now
-                uiDirty = true
             end
-
-            endFrame()
         end
 
         function win:destroy()
@@ -4682,13 +4886,11 @@ do
             activeSlider = nil
             activeScrollDrag = nil
             dragWin = nil
-            focusedBox = nil
+            releaseFocusedTextBox()
+            setCursor(false)
             for i = 1, #connections do pcall(function() connections[i]:Disconnect() end) end
             connections = {}
-            for i = 1, #allDrawings do destroyDrawing(allDrawings[i]) end
-            allDrawings, rectPool, textPool, pc = {}, {}, {}, {}
-            if bridgeGui then pcall(function() bridgeGui:Destroy() end); bridgeGui, bridgeTb = nil, nil end
-            setCursor(false)
+            pcall(function() screenGui:Destroy() end)
         end
 
         bindToggleKey(win.toggleKey)
@@ -4911,7 +5113,11 @@ do
         W.rTargetLbl = sR:newLabel(Resolver.targetStatus(isRu()))
         regLoc(sR:newButton(T("Reset opponent data"), function() Resolver.clear(); toast("Opponent data cleared") end), "Reset opponent data")
         regLoc(sR:newButton(T("Shot statistics"), function() toast(Resolver.shotStatistics()) end), "Shot statistics")
-        regLoc(sR:newButton(T("Print diagnostics"), function() toast(Resolver.diagnose()) end), "Print diagnostics")
+        regLoc(sR:newButton(T("Print diagnostics"), function()
+            local msg = Resolver.diagnose()
+            pcall(Sync.diagnose)
+            toast(msg)
+        end), "Print diagnostics")
     end
 
     -- ===== TAB 2: ANTI-AIM (AA BUILDER 2.0) =====
